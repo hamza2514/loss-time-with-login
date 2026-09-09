@@ -1,0 +1,5 @@
+# Do not commit real credentials or the local database
+auth_config.yaml
+loss_time.db
+__pycache__/
+.streamlit/secrets.toml
