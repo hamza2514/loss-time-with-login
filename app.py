@@ -600,14 +600,17 @@ with tab_dashboard:
             r2c1, r2c2 = st.columns(2)
             with r2c1:
                 section_header("Top 5 Loss Time Reasons", PALETTE["plum"], "🏆")
+                total_minutes_all = fdf["minutes"].sum()
                 top5 = (
                     fdf.groupby("category")["minutes"].sum()
                     .sort_values(ascending=False).head(5).reset_index()
                 )
-                top5_plot = top5.sort_values("minutes")  # ascending so the largest ends up on top
+                top5["pct"] = top5["minutes"] / total_minutes_all * 100
+                top5["label"] = top5.apply(lambda r: f"{r['minutes']:.0f} ({r['pct']:.1f}%)", axis=1)
+                top5_plot = top5.sort_values("minutes", ascending=False)  # largest first so it renders at the top
                 fig_top5 = px.bar(
                     top5_plot, x="minutes", y="category", orientation="h",
-                    text_auto=".0f", color="category",
+                    text="label", color="category",
                     color_discrete_sequence=px.colors.qualitative.Set2,
                 )
                 fig_top5.update_traces(marker_line_width=0, textfont_size=12)
@@ -617,6 +620,7 @@ with tab_dashboard:
                     height=CHART_H, margin=CHART_MARGIN,
                 )
                 st.plotly_chart(fig_top5, use_container_width=True)
+
 
             with r2c2:
                 section_header("Pareto Chart — Loss Time Categories", PALETTE["rose"], "📊")
