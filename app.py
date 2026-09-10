@@ -530,26 +530,32 @@ with tab_dashboard:
     if closed_df.empty:
         st.info("No resolved data yet. Charts will appear here once loss-time entries are logged.")
     else:
-        date_options = sorted(closed_df["entry_date"].unique(), reverse=True)
-        date_label_map = {fmt_ddmmyyyy(d): d for d in date_options}
-        today_label = fmt_ddmmyyyy(today_pkt().isoformat())
-        default_date_selection = [today_label] if today_label in date_label_map else []
+        all_dates = sorted(pd.to_datetime(closed_df["entry_date"]).dt.date.unique())
+        min_date, max_date = all_dates[0], max(all_dates[-1], today_pkt())
 
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
-            date_filter_labels = st.multiselect(
-                "Filter by Date", list(date_label_map.keys()),
-                default=default_date_selection, key="dash_date_filter",
+            date_range = st.date_input(
+                "Filter by Date (from – to)",
+                value=(today_pkt(), today_pkt()),
+                min_value=min_date, max_value=max_date,
+                format="DD-MM-YYYY", key="dash_date_range",
             )
         with fc2:
             line_filter = st.multiselect("Filter by Line", LINES)
         with fc3:
             category_filter = st.multiselect("Filter by Category", CATEGORIES)
 
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_d, end_d = date_range
+        elif isinstance(date_range, tuple) and len(date_range) == 1:
+            start_d = end_d = date_range[0]
+        else:
+            start_d = end_d = date_range
+
         fdf = closed_df.copy()
-        if date_filter_labels:
-            selected_iso = [date_label_map[lbl] for lbl in date_filter_labels]
-            fdf = fdf[fdf["entry_date"].isin(selected_iso)]
+        fdf_dates = pd.to_datetime(fdf["entry_date"]).dt.date
+        fdf = fdf[(fdf_dates >= start_d) & (fdf_dates <= end_d)]
         if line_filter:
             fdf = fdf[fdf["line"].isin(line_filter)]
         if category_filter:
