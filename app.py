@@ -5,7 +5,7 @@ import yaml
 from yaml.loader import SafeLoader
 import streamlit as st
 import streamlit_authenticator as stauth
-import sqlite3
+import psycopg2
 import pandas as pd
 from datetime import date, datetime, timezone, timedelta
 import plotly.express as px
@@ -39,7 +39,7 @@ def parse_dt(iso_str):
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Loss Time Tracker | AM-4CT2", page_icon="🏭", layout="wide")
 
-DB_PATH = "loss_time.db"
+DATABASE_URL_SECRET = "DATABASE_URL"  # set this in Streamlit Secrets (Neon connection string)
 LOGO_PATH = "logo.jpg"
 COMPANY_NAME = "Artistic Milliners"
 UNIT_NAME = "AM-4CT2"
@@ -238,77 +238,91 @@ with st.sidebar:
     authenticator.logout("Logout", "sidebar")
 
 # ----------------------------------------------------------------------------
-# DATABASE HELPERS
+# DATABASE HELPERS  (Postgres / Neon)
 # ----------------------------------------------------------------------------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS loss_time (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry_date TEXT NOT NULL,
-            line TEXT NOT NULL,
-            category TEXT NOT NULL,
-            reason TEXT,
-            minutes REAL,
-            recorded_at TEXT NOT NULL,
-            recorded_by TEXT,
-            status TEXT DEFAULT 'closed',
-            start_time TEXT,
-            end_time TEXT
+def _database_url():
+    try:
+        return st.secrets[DATABASE_URL_SECRET]
+    except Exception:
+        st.error(
+            "No database connection configured. Add a `DATABASE_URL` entry "
+            "(your Neon connection string) to this app's Secrets and reload."
         )
-        """
-    )
+        st.stop()
+
+
+def get_conn():
+    conn = psycopg2.connect(_database_url())
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS loss_time (
+                id SERIAL PRIMARY KEY,
+                entry_date TEXT NOT NULL,
+                line TEXT NOT NULL,
+                category TEXT NOT NULL,
+                reason TEXT,
+                minutes REAL,
+                recorded_at TEXT NOT NULL,
+                recorded_by TEXT,
+                status TEXT DEFAULT 'closed',
+                start_time TEXT,
+                end_time TEXT
+            )
+            """
+        )
+        # Safe to re-run: adds any columns from older versions of this schema that are missing.
+        for col, ddl in [
+            ("recorded_by", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS recorded_by TEXT"),
+            ("status", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'closed'"),
+            ("start_time", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS start_time TEXT"),
+            ("end_time", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT"),
+        ]:
+            cur.execute(ddl)
     conn.commit()
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(loss_time)").fetchall()]
-    for col, ddl in [
-        ("recorded_by", "ALTER TABLE loss_time ADD COLUMN recorded_by TEXT"),
-        ("status", "ALTER TABLE loss_time ADD COLUMN status TEXT DEFAULT 'closed'"),
-        ("start_time", "ALTER TABLE loss_time ADD COLUMN start_time TEXT"),
-        ("end_time", "ALTER TABLE loss_time ADD COLUMN end_time TEXT"),
-    ]:
-        if col not in cols:
-            conn.execute(ddl)
-            conn.commit()
     return conn
 
 
 def add_closed_entry(entry_date, line, category, reason, minutes, recorded_by):
-    conn = get_conn()
     now = now_pkt().isoformat(timespec="seconds")
-    conn.execute(
-        "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
-        "recorded_by, status, start_time, end_time) VALUES (?,?,?,?,?,?,?, 'closed', ?, ?)",
-        (entry_date, line, category, reason, minutes, now, recorded_by, now, now),
-    )
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
+            "recorded_by, status, start_time, end_time) VALUES (%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s)",
+            (entry_date, line, category, reason, minutes, now, recorded_by, now, now),
+        )
     conn.commit()
     conn.close()
 
 
 def start_open_issue(line, category, reason, recorded_by):
-    conn = get_conn()
     now = now_pkt().isoformat(timespec="seconds")
-    conn.execute(
-        "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
-        "recorded_by, status, start_time, end_time) VALUES (?,?,?,?,NULL,?,?, 'open', ?, NULL)",
-        (today_pkt().isoformat(), line, category, reason, now, recorded_by, now),
-    )
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
+            "recorded_by, status, start_time, end_time) VALUES (%s,%s,%s,%s,NULL,%s,%s, 'open', %s, NULL)",
+            (today_pkt().isoformat(), line, category, reason, now, recorded_by, now),
+        )
     conn.commit()
     conn.close()
 
 
 def resolve_issue(entry_id):
     conn = get_conn()
-    row = conn.execute("SELECT start_time FROM loss_time WHERE id=?", (entry_id,)).fetchone()
-    if row:
-        start = parse_dt(row[0])
-        end = now_pkt()
-        minutes = round((end - start).total_seconds() / 60, 1)
-        conn.execute(
-            "UPDATE loss_time SET end_time=?, minutes=?, status='closed' WHERE id=?",
-            (end.isoformat(timespec="seconds"), minutes, entry_id),
-        )
-        conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT start_time FROM loss_time WHERE id=%s", (entry_id,))
+        row = cur.fetchone()
+        if row:
+            start = parse_dt(row[0])
+            end = now_pkt()
+            minutes = round((end - start).total_seconds() / 60, 1)
+            cur.execute(
+                "UPDATE loss_time SET end_time=%s, minutes=%s, status='closed' WHERE id=%s",
+                (end.isoformat(timespec="seconds"), minutes, entry_id),
+            )
+    conn.commit()
     conn.close()
 
 
@@ -321,9 +335,11 @@ def load_data():
 
 def delete_entry(entry_id):
     conn = get_conn()
-    conn.execute("DELETE FROM loss_time WHERE id=?", (entry_id,))
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM loss_time WHERE id=%s", (entry_id,))
     conn.commit()
     conn.close()
+
 
 
 if "selected_date" not in st.session_state:
