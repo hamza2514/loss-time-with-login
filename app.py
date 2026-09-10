@@ -7,10 +7,32 @@ import streamlit as st
 import streamlit_authenticator as stauth
 import sqlite3
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
+
+# ----------------------------------------------------------------------------
+# TIMEZONE — Pakistan Standard Time, fixed UTC+5 (no DST observed)
+# ----------------------------------------------------------------------------
+PKT = timezone(timedelta(hours=5))
+
+
+def now_pkt():
+    return datetime.now(PKT)
+
+
+def today_pkt():
+    return now_pkt().date()
+
+
+def parse_dt(iso_str):
+    """Parse a stored ISO timestamp; treat old naive timestamps as already-PKT."""
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=PKT)
+    return dt
+
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -253,7 +275,7 @@ def get_conn():
 
 def add_closed_entry(entry_date, line, category, reason, minutes, recorded_by):
     conn = get_conn()
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_pkt().isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
         "recorded_by, status, start_time, end_time) VALUES (?,?,?,?,?,?,?, 'closed', ?, ?)",
@@ -265,11 +287,11 @@ def add_closed_entry(entry_date, line, category, reason, minutes, recorded_by):
 
 def start_open_issue(line, category, reason, recorded_by):
     conn = get_conn()
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_pkt().isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
         "recorded_by, status, start_time, end_time) VALUES (?,?,?,?,NULL,?,?, 'open', ?, NULL)",
-        (date.today().isoformat(), line, category, reason, now, recorded_by, now),
+        (today_pkt().isoformat(), line, category, reason, now, recorded_by, now),
     )
     conn.commit()
     conn.close()
@@ -279,8 +301,8 @@ def resolve_issue(entry_id):
     conn = get_conn()
     row = conn.execute("SELECT start_time FROM loss_time WHERE id=?", (entry_id,)).fetchone()
     if row:
-        start = datetime.fromisoformat(row[0])
-        end = datetime.now()
+        start = parse_dt(row[0])
+        end = now_pkt()
         minutes = round((end - start).total_seconds() / 60, 1)
         conn.execute(
             "UPDATE loss_time SET end_time=?, minutes=?, status='closed' WHERE id=?",
@@ -305,7 +327,7 @@ def delete_entry(entry_id):
 
 
 if "selected_date" not in st.session_state:
-    st.session_state.selected_date = date.today()
+    st.session_state.selected_date = today_pkt()
 
 st_autorefresh(interval=15_000, key="global_refresh")  # keeps ongoing-issue timers & dashboard live
 
@@ -393,14 +415,14 @@ if can_enter_data:
             if open_df.empty:
                 st.info("No ongoing issues right now.")
             else:
-                now = datetime.now()
+                now = now_pkt()
                 for _, row in open_df.iterrows():
-                    elapsed = round((now - datetime.fromisoformat(row["start_time"])).total_seconds() / 60)
+                    elapsed = round((now - parse_dt(row["start_time"])).total_seconds() / 60)
                     ic1, ic2 = st.columns([5, 1])
                     with ic1:
                         st.markdown(
                             f"🔴 **{row['line']}** — {row['category']} — *{row['reason']}* "
-                            f"— running **{elapsed} min** (started {datetime.fromisoformat(row['start_time']).strftime('%H:%M')})"
+                            f"— running **{elapsed} min** (started {parse_dt(row['start_time']).strftime('%H:%M')})"
                         )
                     with ic2:
                         if st.button("Resolve", key=f"resolve_{row['id']}"):
@@ -486,7 +508,7 @@ with tab_dashboard:
 
     # ---- Live ongoing-issue alert banner ----
     if not open_df.empty:
-        now = datetime.now()
+        now = now_pkt()
         st.markdown(
             f"<div style='background:#fdecea; border:1px solid {PALETTE['rose']}; "
             f"border-radius:10px; padding:10px 16px; margin-bottom:10px;'>"
@@ -495,7 +517,7 @@ with tab_dashboard:
             unsafe_allow_html=True,
         )
         for _, row in open_df.iterrows():
-            elapsed = round((now - datetime.fromisoformat(row["start_time"])).total_seconds() / 60)
+            elapsed = round((now - parse_dt(row["start_time"])).total_seconds() / 60)
             st.markdown(
                 f"<div style='padding:3px 0 3px 4px; font-size:14px;'>"
                 f"🔴 <b>{row['line']}</b> — {row['category']} — running <b>{elapsed} min</b></div>",
@@ -569,32 +591,46 @@ with tab_dashboard:
                 )
                 st.plotly_chart(fig2, use_container_width=True)
 
-            # ---- Row 2: Pareto (full width) ----
-            section_header("Pareto Chart — Loss Time Categories", PALETTE["rose"], "📊")
-            pareto = fdf.groupby("category")["minutes"].sum().sort_values(ascending=False).reset_index()
-            pareto["cum_pct"] = pareto["minutes"].cumsum() / pareto["minutes"].sum() * 100
-            fig3 = go.Figure()
-            fig3.add_bar(x=pareto["category"], y=pareto["minutes"], name="Minutes Lost",
-                          marker=dict(color=pareto["minutes"], colorscale="Tealgrn", line=dict(width=0)),
-                          text=pareto["minutes"].round(0), textposition="outside", textfont_size=11)
-            fig3.add_trace(go.Scatter(x=pareto["category"], y=pareto["cum_pct"], name="Cumulative %",
-                                       yaxis="y2", mode="lines+markers",
-                                       line=dict(color=PALETTE["rose"], width=2.5), marker=dict(size=7)))
-            fig3.add_hline(y=80, line_dash="dot", line_color="gray", yref="y2")
-            fig3.update_layout(
-                yaxis=dict(title="Minutes"), yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 110]),
-                xaxis_tickangle=-25, legend=dict(orientation="h", y=1.15, font=dict(size=11)),
-                plot_bgcolor="white", paper_bgcolor="white", height=CHART_H, margin=CHART_MARGIN,
-            )
-            st.plotly_chart(fig3, use_container_width=True)
+            # ---- Row 2: Top 5 Loss Time Reasons | Pareto ----
+            r2c1, r2c2 = st.columns(2)
+            with r2c1:
+                section_header("Top 5 Loss Time Reasons", PALETTE["plum"], "🏆")
+                top5 = (
+                    fdf.groupby("category")["minutes"].sum()
+                    .sort_values(ascending=False).head(5).reset_index()
+                )
+                top5_plot = top5.sort_values("minutes")  # ascending so the largest ends up on top
+                fig_top5 = px.bar(
+                    top5_plot, x="minutes", y="category", orientation="h",
+                    text_auto=".0f", color="category",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig_top5.update_traces(marker_line_width=0, textfont_size=12)
+                fig_top5.update_layout(
+                    showlegend=False, yaxis_title="", xaxis_title="Minutes",
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    height=CHART_H, margin=CHART_MARGIN,
+                )
+                st.plotly_chart(fig_top5, use_container_width=True)
 
-            # ---- Row 3: Heatmap (full width, all 6 lines forced visible) ----
-            section_header("Line × Category Heatmap", PALETTE["teal"], "🔥")
-            heat = fdf.pivot_table(index="line", columns="category", values="minutes",
-                                    aggfunc="sum", fill_value=0).reindex(LINES)
-            fig4 = px.imshow(heat, text_auto=".0f", aspect="auto", color_continuous_scale="Sunsetdark")
-            fig4.update_yaxes(tickmode="array", tickvals=list(range(len(LINES))), ticktext=LINES)
-            fig4.update_layout(xaxis_tickangle=-20, paper_bgcolor="white",
-                                height=CHART_H + 20, margin=CHART_MARGIN, font_size=11)
-            fig4.update_traces(xgap=3, ygap=3)
-            st.plotly_chart(fig4, use_container_width=True)
+            with r2c2:
+                section_header("Pareto Chart — Loss Time Categories", PALETTE["rose"], "📊")
+                pareto = fdf.groupby("category")["minutes"].sum().sort_values(ascending=False).reset_index()
+                pareto["cum_pct"] = pareto["minutes"].cumsum() / pareto["minutes"].sum() * 100
+                fig3 = go.Figure()
+                fig3.add_bar(x=pareto["category"], y=pareto["minutes"], name="Minutes Lost",
+                              marker=dict(color=pareto["minutes"], colorscale="Tealgrn", line=dict(width=0)),
+                              text=pareto["minutes"].round(0), textposition="outside", textfont_size=10)
+                fig3.add_trace(go.Scatter(x=pareto["category"], y=pareto["cum_pct"], name="Cumulative %",
+                                           yaxis="y2", mode="lines+markers",
+                                           line=dict(color=PALETTE["rose"], width=2.5), marker=dict(size=6)))
+                fig3.add_hline(y=80, line_dash="dot", line_color="gray", yref="y2")
+                fig3.update_layout(
+                    yaxis=dict(title="Minutes", tickfont_size=9),
+                    yaxis2=dict(title="Cum %", overlaying="y", side="right", range=[0, 110], tickfont_size=9),
+                    xaxis_tickangle=-35, xaxis_tickfont_size=9,
+                    legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+                    plot_bgcolor="white", paper_bgcolor="white", height=CHART_H, margin=CHART_MARGIN,
+                )
+                st.plotly_chart(fig3, use_container_width=True)
+
