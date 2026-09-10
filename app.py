@@ -532,10 +532,15 @@ with tab_dashboard:
     else:
         date_options = sorted(closed_df["entry_date"].unique(), reverse=True)
         date_label_map = {fmt_ddmmyyyy(d): d for d in date_options}
+        today_label = fmt_ddmmyyyy(today_pkt().isoformat())
+        default_date_selection = [today_label] if today_label in date_label_map else []
 
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
-            date_filter_labels = st.multiselect("Filter by Date", list(date_label_map.keys()))
+            date_filter_labels = st.multiselect(
+                "Filter by Date", list(date_label_map.keys()),
+                default=default_date_selection, key="dash_date_filter",
+            )
         with fc2:
             line_filter = st.multiselect("Filter by Line", LINES)
         with fc3:
