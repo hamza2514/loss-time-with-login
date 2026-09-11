@@ -357,7 +357,7 @@ def delete_entry(entry_id):
 if "selected_date" not in st.session_state:
     st.session_state.selected_date = today_pkt()
 
-st_autorefresh(interval=15_000, key="global_refresh")  # keeps ongoing-issue timers & dashboard live
+st_autorefresh(interval=30 * 60_000, key="global_refresh")  # refresh only every 30 min; otherwise only on manual reload
 
 # ----------------------------------------------------------------------------
 # HEADER
@@ -596,9 +596,12 @@ with tab_dashboard:
         )
         for _, row in open_df.iterrows():
             elapsed = round((now - parse_dt(row["start_time"])).total_seconds() / 60)
+            ws = row["workstations_affected"] or 1
+            total_so_far = round(elapsed * ws)
             st.markdown(
                 f"<div style='padding:3px 0 3px 4px; font-size:14px;'>"
-                f"🔴 <b>{row['line']}</b> — {row['category']} — running <b>{elapsed} min</b></div>",
+                f"🔴 <b>{row['line']}</b> — {row['category']} — running <b>{elapsed} min</b> "
+                f"({total_so_far} minutes lost)</div>",
                 unsafe_allow_html=True,
             )
         st.markdown("</div>", unsafe_allow_html=True)
@@ -697,7 +700,7 @@ with tab_dashboard:
                     text="label", color="category",
                     color_discrete_sequence=px.colors.qualitative.Set2,
                 )
-                fig_top5.update_traces(marker_line_width=0, textfont_size=12)
+                fig_top5.update_traces(marker_line_width=0, textfont_size=12, width=0.55)
                 fig_top5.update_layout(
                     showlegend=False, yaxis_title="", xaxis_title="Minutes",
                     plot_bgcolor="white", paper_bgcolor="white",
@@ -711,7 +714,7 @@ with tab_dashboard:
                 pareto = fdf.groupby("category")["minutes"].sum().sort_values(ascending=False).reset_index()
                 pareto["cum_pct"] = pareto["minutes"].cumsum() / pareto["minutes"].sum() * 100
                 fig3 = go.Figure()
-                fig3.add_bar(x=pareto["category"], y=pareto["minutes"], name="Minutes Lost",
+                fig3.add_bar(x=pareto["category"], y=pareto["minutes"], name="Minutes Lost", width=0.5,
                               marker=dict(color=pareto["minutes"], colorscale="Tealgrn", line=dict(width=0)),
                               text=pareto["minutes"].round(0), textposition="outside", textfont_size=10)
                 fig3.add_trace(go.Scatter(x=pareto["category"], y=pareto["cum_pct"], name="Cumulative %",
