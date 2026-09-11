@@ -38,12 +38,13 @@ def parse_dt(iso_str):
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="Loss Time Tracker | AM-4CT2", page_icon="🏭", layout="wide")
+st.set_page_config(page_title="Loss Time Tracker | Artistic Milliners", page_icon="🏭", layout="wide")
 
 DATABASE_URL_SECRET = "DATABASE_URL"  # set this in Streamlit Secrets (Neon connection string)
 LOGO_PATH = "logo.jpg"
 COMPANY_NAME = "Artistic Milliners"
-UNIT_NAME = "AM-4CT2"
+ALL_UNITS = ["AM-4CT2", "AM-4A"]
+DEFAULT_UNIT = "AM-4CT2"  # fallback for any account whose config is missing a "units" list
 
 CATEGORIES = [
     "Trim Issues / Fabric Issue",
@@ -149,11 +150,16 @@ def _logo_data_uri():
     return f"data:image/jpeg;base64,{b64}"
 
 
-def brand_header(center=False):
-    """Single self-contained flex block: logo + wordmark. Avoids column-layout clipping."""
+def brand_header(center=False, unit=None):
+    """Single self-contained flex block: logo + wordmark. Avoids column-layout clipping.
+    `unit` is the active unit to display; pass None on the login screen (not chosen yet)."""
     logo_uri = _logo_data_uri()
     logo_html = f"<img src='{logo_uri}' style='height:52px; width:auto; flex-shrink:0;'/>" if logo_uri else ""
     justify = "center" if center else "flex-start"
+    unit_line = (
+        f"<div style='font-size:13px; color:#666; font-weight:600;'>Unit: {unit}</div>"
+        if unit else ""
+    )
     st.markdown(
         f"""
         <div style="display:flex; align-items:center; gap:16px; justify-content:{justify};
@@ -164,8 +170,7 @@ def brand_header(center=False):
                             font-weight:700; text-transform:uppercase;">{COMPANY_NAME}</div>
                 <div style="font-size:23px; font-weight:800; color:{PALETTE['navy']};">
                     Line Loss Time Tracker</div>
-                <div style="font-size:13px; color:#666; font-weight:600;">
-                    Unit: {UNIT_NAME}</div>
+                {unit_line}
             </div>
         </div>
         """,
@@ -228,8 +233,14 @@ elif auth_status is None:
 
 username = st.session_state.get("username")
 display_name = st.session_state.get("name")
-user_role = credentials["usernames"].get(username, {}).get("role", "viewer")
+user_cfg = credentials["usernames"].get(username, {})
+user_role = user_cfg.get("role", "viewer")
 can_enter_data = user_role == "entry"
+
+# Units this account is allowed to see. Missing "units" key -> single default unit
+# (keeps any old-style account config working without edits).
+allowed_units = user_cfg.get("units") or [DEFAULT_UNIT]
+allowed_units = [u for u in allowed_units if u in ALL_UNITS] or [DEFAULT_UNIT]
 
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
@@ -240,6 +251,12 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.markdown(f"**{display_name}**")
+
+    if len(allowed_units) > 1:
+        active_unit = st.selectbox("Active Unit", allowed_units, key="active_unit_select")
+    else:
+        active_unit = allowed_units[0]
+
     authenticator.logout("Logout", "sidebar")
 
 # ----------------------------------------------------------------------------
@@ -288,6 +305,7 @@ def get_pool():
                 "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT",
                 "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS minutes_lost REAL",
                 "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS workstations_affected REAL",
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS unit TEXT DEFAULT 'AM-4CT2'",
             ]:
                 cur.execute(ddl)
         conn.commit()
@@ -304,7 +322,7 @@ def release_conn(conn):
     get_pool().putconn(conn)
 
 
-def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstations_affected, recorded_by):
+def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstations_affected, recorded_by, unit):
     total_minutes = round(minutes_lost * workstations_affected, 1)
     now = now_pkt().isoformat(timespec="seconds")
     conn = get_conn()
@@ -312,26 +330,26 @@ def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstati
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
-                "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s)",
+                "workstations_affected, recorded_at, recorded_by, status, start_time, end_time, unit) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s, %s)",
                 (entry_date, line, category, reason, total_minutes, minutes_lost, workstations_affected,
-                 now, recorded_by, now, now),
+                 now, recorded_by, now, now, unit),
             )
         conn.commit()
     finally:
         release_conn(conn)
 
 
-def start_open_issue(line, category, reason, workstations_affected, recorded_by):
+def start_open_issue(line, category, reason, workstations_affected, recorded_by, unit):
     now = now_pkt().isoformat(timespec="seconds")
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
-                "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
-                "VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s,%s, 'open', %s, NULL)",
-                (today_pkt().isoformat(), line, category, reason, workstations_affected, now, recorded_by, now),
+                "workstations_affected, recorded_at, recorded_by, status, start_time, end_time, unit) "
+                "VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s,%s, 'open', %s, NULL, %s)",
+                (today_pkt().isoformat(), line, category, reason, workstations_affected, now, recorded_by, now, unit),
             )
         conn.commit()
     finally:
@@ -387,7 +405,7 @@ st_autorefresh(interval=30 * 60_000, key="global_refresh")  # refresh only every
 # ----------------------------------------------------------------------------
 # HEADER
 # ----------------------------------------------------------------------------
-brand_header()
+brand_header(unit=active_unit)
 st.markdown("<hr style='margin-top:2px; margin-bottom:10px;'>", unsafe_allow_html=True)
 
 if can_enter_data:
@@ -397,7 +415,10 @@ else:
     tab_entry = None
 
 # One query per page render, shared by every tab below (instead of each tab querying separately).
+# Scoped to the active unit here so every tab below (entry, today's log, all records,
+# dashboard) automatically only ever sees/writes data for that one unit.
 df_all = load_data()
+df_all = df_all[df_all["unit"].fillna(DEFAULT_UNIT) == active_unit]
 
 # ----------------------------------------------------------------------------
 # DATA ENTRY (entry-role only)
@@ -467,6 +488,7 @@ if can_enter_data:
                     add_closed_entry(
                         st.session_state.selected_date.isoformat(),
                         line, category, reason.strip(), minutes_lost, workstations_affected, display_name,
+                        active_unit,
                     )
                     total_minutes = minutes_lost * workstations_affected
                     st.success(f"Recorded: {line} | {category} | {total_minutes:.0f} total min "
@@ -497,7 +519,7 @@ if can_enter_data:
                     elif o_workstations is None or o_workstations < 1:
                         st.error("Please enter the number of work-stations affected.")
                     else:
-                        start_open_issue(o_line, o_category, o_reason.strip(), o_workstations, display_name)
+                        start_open_issue(o_line, o_category, o_reason.strip(), o_workstations, display_name, active_unit)
                         st.success(f"Started: {o_line} | {o_category} — now live on the Dashboard.")
                         st.rerun()
 
@@ -541,6 +563,11 @@ if can_enter_data:
                     "minutes": "Total Minutes Lost",
                 })
                 st.dataframe(disp, use_container_width=True, hide_index=True, height=260)
+                st.download_button(
+                    "⬇️ Download Today's Records as Excel", to_excel_bytes(disp),
+                    file_name=f"loss_time_today_{st.session_state.selected_date.isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                 with st.expander("🗑️ Delete an entry (mistake correction)"):
                     del_id = st.selectbox(
                         "Select entry ID to delete",
