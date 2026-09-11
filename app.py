@@ -233,8 +233,12 @@ can_enter_data = user_role == "entry"
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, width=60)
+    st.markdown(
+        f"<div style='font-size:11px; letter-spacing:1.5px; color:{PALETTE['gray']}; "
+        f"font-weight:700; text-transform:uppercase;'>{COMPANY_NAME}</div>",
+        unsafe_allow_html=True,
+    )
     st.markdown(f"**{display_name}**")
-    st.caption(f"Role: {'Data Entry + Dashboard' if can_enter_data else 'Dashboard (view only)'}")
     authenticator.logout("Logout", "sidebar")
 
 # ----------------------------------------------------------------------------
@@ -277,33 +281,39 @@ def get_conn():
             ("status", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'closed'"),
             ("start_time", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS start_time TEXT"),
             ("end_time", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT"),
+            ("minutes_lost", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS minutes_lost REAL"),
+            ("workstations_affected", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS workstations_affected REAL"),
         ]:
             cur.execute(ddl)
     conn.commit()
     return conn
 
 
-def add_closed_entry(entry_date, line, category, reason, minutes, recorded_by):
+def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstations_affected, recorded_by):
+    total_minutes = round(minutes_lost * workstations_affected, 1)
     now = now_pkt().isoformat(timespec="seconds")
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
-            "recorded_by, status, start_time, end_time) VALUES (%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s)",
-            (entry_date, line, category, reason, minutes, now, recorded_by, now, now),
+            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
+            "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s)",
+            (entry_date, line, category, reason, total_minutes, minutes_lost, workstations_affected,
+             now, recorded_by, now, now),
         )
     conn.commit()
     conn.close()
 
 
-def start_open_issue(line, category, reason, recorded_by):
+def start_open_issue(line, category, reason, workstations_affected, recorded_by):
     now = now_pkt().isoformat(timespec="seconds")
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, recorded_at, "
-            "recorded_by, status, start_time, end_time) VALUES (%s,%s,%s,%s,NULL,%s,%s, 'open', %s, NULL)",
-            (today_pkt().isoformat(), line, category, reason, now, recorded_by, now),
+            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
+            "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
+            "VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s,%s, 'open', %s, NULL)",
+            (today_pkt().isoformat(), line, category, reason, workstations_affected, now, recorded_by, now),
         )
     conn.commit()
     conn.close()
@@ -312,15 +322,17 @@ def start_open_issue(line, category, reason, recorded_by):
 def resolve_issue(entry_id):
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT start_time FROM loss_time WHERE id=%s", (entry_id,))
+        cur.execute("SELECT start_time, workstations_affected FROM loss_time WHERE id=%s", (entry_id,))
         row = cur.fetchone()
         if row:
             start = parse_dt(row[0])
+            workstations_affected = row[1] or 1
             end = now_pkt()
-            minutes = round((end - start).total_seconds() / 60, 1)
+            elapsed_minutes = round((end - start).total_seconds() / 60, 1)
+            total_minutes = round(elapsed_minutes * workstations_affected, 1)
             cur.execute(
-                "UPDATE loss_time SET end_time=%s, minutes=%s, status='closed' WHERE id=%s",
-                (end.isoformat(timespec="seconds"), minutes, entry_id),
+                "UPDATE loss_time SET end_time=%s, minutes_lost=%s, minutes=%s, status='closed' WHERE id=%s",
+                (end.isoformat(timespec="seconds"), elapsed_minutes, total_minutes, entry_id),
             )
     conn.commit()
     conn.close()
@@ -380,29 +392,59 @@ if can_enter_data:
 
             section_header("Log a Resolved Loss Time Event", PALETTE["amber"], "⏱️")
             st.caption("Use this for issues that are already over. For an issue still happening, use the **Ongoing Issues** tab instead.")
-            with st.form("entry_form", clear_on_submit=True):
-                c1, c2 = st.columns(2)
-                with c1:
-                    line = st.selectbox("Select Line", LINES)
-                with c2:
-                    category = st.selectbox("Select Reason Category", CATEGORIES)
-                reason = st.text_area("Detailed Reason", height=80,
-                                       placeholder="e.g. Waiting for trim from store...")
-                minutes = st.number_input("Minutes Lost", min_value=0.0, step=1.0, format="%.0f")
-                submitted = st.form_submit_button("Submit", use_container_width=True, type="primary")
 
-                if submitted:
-                    if minutes <= 0:
-                        st.error("Please enter minutes lost greater than 0.")
-                    elif not reason.strip():
-                        st.error("Please enter a detailed reason.")
-                    else:
-                        add_closed_entry(
-                            st.session_state.selected_date.isoformat(),
-                            line, category, reason.strip(), minutes, display_name,
-                        )
-                        st.success(f"Recorded: {line} | {category} | {minutes:.0f} min")
-                        st.rerun()
+            if "entry_form_key" not in st.session_state:
+                st.session_state.entry_form_key = 0
+            fk = st.session_state.entry_form_key
+
+            c1, c2 = st.columns(2)
+            with c1:
+                line = st.selectbox("Select Line", LINES, key=f"line_{fk}")
+            with c2:
+                category = st.selectbox("Select Reason Category", CATEGORIES, key=f"category_{fk}")
+            reason = st.text_area("Detailed Reason", height=80, key=f"reason_{fk}",
+                                   placeholder="e.g. Waiting for trim from store...")
+            c3, c4 = st.columns(2)
+            with c3:
+                minutes_lost = st.number_input(
+                    "Minutes Lost", min_value=0.0, step=1.0, value=None, format="%.0f",
+                    placeholder="Enter minutes lost", key=f"minutes_lost_{fk}",
+                )
+            with c4:
+                workstations_affected = st.number_input(
+                    "No. of Work-stations Affected", min_value=1, step=1, value=None, format="%d",
+                    placeholder="Enter no. of work-stations", key=f"workstations_{fk}",
+                )
+
+            if minutes_lost is not None and workstations_affected is not None:
+                total_preview = minutes_lost * workstations_affected
+                st.markdown(
+                    f"<div style='background:#f0f2f6; border-radius:10px; padding:10px 14px; "
+                    f"margin:6px 0; font-size:14px;'>"
+                    f"<b>Total Minutes Lost</b> = {minutes_lost:.0f} × {workstations_affected:.0f} "
+                    f"= <b style='color:{PALETTE['rose']};'>{total_preview:.0f}</b></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Total Minutes Lost will be calculated here once both fields above are filled in.")
+
+            if st.button("Submit", use_container_width=True, type="primary", key=f"submit_btn_{fk}"):
+                if minutes_lost is None or minutes_lost <= 0:
+                    st.error("Please enter minutes lost greater than 0.")
+                elif workstations_affected is None or workstations_affected < 1:
+                    st.error("Please enter the number of work-stations affected.")
+                elif not reason.strip():
+                    st.error("Please enter a detailed reason.")
+                else:
+                    add_closed_entry(
+                        st.session_state.selected_date.isoformat(),
+                        line, category, reason.strip(), minutes_lost, workstations_affected, display_name,
+                    )
+                    total_minutes = minutes_lost * workstations_affected
+                    st.success(f"Recorded: {line} | {category} | {total_minutes:.0f} total min "
+                               f"({minutes_lost:.0f} × {workstations_affected:.0f})")
+                    st.session_state.entry_form_key += 1
+                    st.rerun()
 
         # ---- Ongoing issues: start now / resolve later ----
         with sub_ongoing:
@@ -416,12 +458,18 @@ if can_enter_data:
                     o_category = st.selectbox("Select Reason Category", CATEGORIES, key="o_cat")
                 o_reason = st.text_area("Detailed Reason", height=70, key="o_reason",
                                          placeholder="e.g. Main sewing machine motor failure...")
+                o_workstations = st.number_input(
+                    "No. of Work-stations Affected", min_value=1, step=1, value=None, format="%d",
+                    placeholder="Enter no. of work-stations", key="o_workstations",
+                )
                 start_submitted = st.form_submit_button("🔴 Start Issue", use_container_width=True, type="primary")
                 if start_submitted:
                     if not o_reason.strip():
                         st.error("Please enter a detailed reason.")
+                    elif o_workstations is None or o_workstations < 1:
+                        st.error("Please enter the number of work-stations affected.")
                     else:
-                        start_open_issue(o_line, o_category, o_reason.strip(), display_name)
+                        start_open_issue(o_line, o_category, o_reason.strip(), o_workstations, display_name)
                         st.success(f"Started: {o_line} | {o_category} — now live on the Dashboard.")
                         st.rerun()
 
@@ -434,11 +482,15 @@ if can_enter_data:
                 now = now_pkt()
                 for _, row in open_df.iterrows():
                     elapsed = round((now - parse_dt(row["start_time"])).total_seconds() / 60)
+                    ws = row["workstations_affected"] or 1
+                    running_total = elapsed * ws
                     ic1, ic2 = st.columns([5, 1])
                     with ic1:
                         st.markdown(
                             f"🔴 **{row['line']}** — {row['category']} — *{row['reason']}* "
-                            f"— running **{elapsed} min** (started {parse_dt(row['start_time']).strftime('%H:%M')})"
+                            f"— running **{elapsed} min** × **{ws:.0f} work-stations** "
+                            f"= **{running_total:.0f} total min so far** "
+                            f"(started {parse_dt(row['start_time']).strftime('%H:%M')})"
                         )
                     with ic2:
                         if st.button("Resolve", key=f"resolve_{row['id']}"):
@@ -455,8 +507,13 @@ if can_enter_data:
                 kpi_card("Total Lost Minutes Today", f"{df_today['minutes'].sum():,.0f}",
                          PALETTE["rose"], "#e67e22")
                 st.write("")
-                disp = df_today[["id", "line", "category", "reason", "minutes", "entry_date"]].copy()
+                disp = df_today[["id", "line", "category", "reason", "minutes_lost",
+                                  "workstations_affected", "minutes", "entry_date"]].copy()
                 disp["entry_date"] = disp["entry_date"].apply(fmt_ddmmyyyy)
+                disp = disp.rename(columns={
+                    "minutes_lost": "Minutes Lost", "workstations_affected": "Work-stations Affected",
+                    "minutes": "Total Minutes Lost",
+                })
                 st.dataframe(disp, use_container_width=True, hide_index=True, height=260)
                 with st.expander("🗑️ Delete an entry (mistake correction)"):
                     del_id = st.selectbox(
@@ -501,9 +558,14 @@ if can_enter_data:
 
                 section_header("All Records", PALETTE["navy"], "🗂️")
                 disp_all = rdf.sort_values("recorded_at", ascending=False)[
-                    ["id", "entry_date", "line", "category", "reason", "minutes", "recorded_by"]
+                    ["id", "entry_date", "line", "category", "reason", "minutes_lost",
+                     "workstations_affected", "minutes", "recorded_by"]
                 ].copy()
                 disp_all["entry_date"] = disp_all["entry_date"].apply(fmt_ddmmyyyy)
+                disp_all = disp_all.rename(columns={
+                    "minutes_lost": "Minutes Lost", "workstations_affected": "Work-stations Affected",
+                    "minutes": "Total Minutes Lost",
+                })
                 st.dataframe(disp_all, use_container_width=True, hide_index=True, height=340)
 
                 dl1, dl2 = st.columns(2)
