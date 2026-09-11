@@ -6,6 +6,7 @@ from yaml.loader import SafeLoader
 import streamlit as st
 import streamlit_authenticator as stauth
 import psycopg2
+import psycopg2.pool
 import pandas as pd
 from datetime import date, datetime, timezone, timedelta
 import plotly.express as px
@@ -242,7 +243,7 @@ with st.sidebar:
     authenticator.logout("Logout", "sidebar")
 
 # ----------------------------------------------------------------------------
-# DATABASE HELPERS  (Postgres / Neon)
+# DATABASE HELPERS  (Postgres / Neon) — pooled connections, schema set up once
 # ----------------------------------------------------------------------------
 def _database_url():
     try:
@@ -255,102 +256,126 @@ def _database_url():
         st.stop()
 
 
-def get_conn():
-    conn = psycopg2.connect(_database_url())
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS loss_time (
-                id SERIAL PRIMARY KEY,
-                entry_date TEXT NOT NULL,
-                line TEXT NOT NULL,
-                category TEXT NOT NULL,
-                reason TEXT,
-                minutes REAL,
-                recorded_at TEXT NOT NULL,
-                recorded_by TEXT,
-                status TEXT DEFAULT 'closed',
-                start_time TEXT,
-                end_time TEXT
+@st.cache_resource
+def get_pool():
+    """One pooled set of connections, reused across reruns and sessions —
+    avoids a fresh network handshake to Neon on every single query."""
+    p = psycopg2.pool.ThreadedConnectionPool(1, 10, _database_url())
+    conn = p.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS loss_time (
+                    id SERIAL PRIMARY KEY,
+                    entry_date TEXT NOT NULL,
+                    line TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    reason TEXT,
+                    minutes REAL,
+                    recorded_at TEXT NOT NULL,
+                    recorded_by TEXT,
+                    status TEXT DEFAULT 'closed',
+                    start_time TEXT,
+                    end_time TEXT
+                )
+                """
             )
-            """
-        )
-        # Safe to re-run: adds any columns from older versions of this schema that are missing.
-        for col, ddl in [
-            ("recorded_by", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS recorded_by TEXT"),
-            ("status", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'closed'"),
-            ("start_time", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS start_time TEXT"),
-            ("end_time", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT"),
-            ("minutes_lost", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS minutes_lost REAL"),
-            ("workstations_affected", "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS workstations_affected REAL"),
-        ]:
-            cur.execute(ddl)
-    conn.commit()
-    return conn
+            for ddl in [
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS recorded_by TEXT",
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'closed'",
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS start_time TEXT",
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT",
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS minutes_lost REAL",
+                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS workstations_affected REAL",
+            ]:
+                cur.execute(ddl)
+        conn.commit()
+    finally:
+        p.putconn(conn)
+    return p
+
+
+def get_conn():
+    return get_pool().getconn()
+
+
+def release_conn(conn):
+    get_pool().putconn(conn)
 
 
 def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstations_affected, recorded_by):
     total_minutes = round(minutes_lost * workstations_affected, 1)
     now = now_pkt().isoformat(timespec="seconds")
     conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
-            "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s)",
-            (entry_date, line, category, reason, total_minutes, minutes_lost, workstations_affected,
-             now, recorded_by, now, now),
-        )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
+                "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, 'closed', %s, %s)",
+                (entry_date, line, category, reason, total_minutes, minutes_lost, workstations_affected,
+                 now, recorded_by, now, now),
+            )
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def start_open_issue(line, category, reason, workstations_affected, recorded_by):
     now = now_pkt().isoformat(timespec="seconds")
     conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
-            "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
-            "VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s,%s, 'open', %s, NULL)",
-            (today_pkt().isoformat(), line, category, reason, workstations_affected, now, recorded_by, now),
-        )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO loss_time (entry_date, line, category, reason, minutes, minutes_lost, "
+                "workstations_affected, recorded_at, recorded_by, status, start_time, end_time) "
+                "VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s,%s, 'open', %s, NULL)",
+                (today_pkt().isoformat(), line, category, reason, workstations_affected, now, recorded_by, now),
+            )
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def resolve_issue(entry_id):
     conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("SELECT start_time, workstations_affected FROM loss_time WHERE id=%s", (entry_id,))
-        row = cur.fetchone()
-        if row:
-            start = parse_dt(row[0])
-            workstations_affected = row[1] or 1
-            end = now_pkt()
-            elapsed_minutes = round((end - start).total_seconds() / 60, 1)
-            total_minutes = round(elapsed_minutes * workstations_affected, 1)
-            cur.execute(
-                "UPDATE loss_time SET end_time=%s, minutes_lost=%s, minutes=%s, status='closed' WHERE id=%s",
-                (end.isoformat(timespec="seconds"), elapsed_minutes, total_minutes, entry_id),
-            )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT start_time, workstations_affected FROM loss_time WHERE id=%s", (entry_id,))
+            row = cur.fetchone()
+            if row:
+                start = parse_dt(row[0])
+                workstations_affected = row[1] or 1
+                end = now_pkt()
+                elapsed_minutes = round((end - start).total_seconds() / 60, 1)
+                total_minutes = round(elapsed_minutes * workstations_affected, 1)
+                cur.execute(
+                    "UPDATE loss_time SET end_time=%s, minutes_lost=%s, minutes=%s, status='closed' WHERE id=%s",
+                    (end.isoformat(timespec="seconds"), elapsed_minutes, total_minutes, entry_id),
+                )
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 def load_data():
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM loss_time ORDER BY id DESC", conn)
-    conn.close()
+    try:
+        df = pd.read_sql_query("SELECT * FROM loss_time ORDER BY id DESC", conn)
+    finally:
+        release_conn(conn)
     return df
 
 
 def delete_entry(entry_id):
     conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM loss_time WHERE id=%s", (entry_id,))
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM loss_time WHERE id=%s", (entry_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 
 
@@ -370,6 +395,9 @@ if can_enter_data:
 else:
     tab_dashboard = st.container()
     tab_entry = None
+
+# One query per page render, shared by every tab below (instead of each tab querying separately).
+df_all = load_data()
 
 # ----------------------------------------------------------------------------
 # DATA ENTRY (entry-role only)
@@ -474,7 +502,6 @@ if can_enter_data:
                         st.rerun()
 
             section_header("Currently Ongoing", PALETTE["rose"], "⏳")
-            df_all = load_data()
             open_df = df_all[df_all["status"] == "open"].copy()
             if open_df.empty:
                 st.info("No ongoing issues right now.")
@@ -499,7 +526,6 @@ if can_enter_data:
 
         # ---- Today's log ----
         with sub_today:
-            df_all = load_data()
             df_today = df_all[(df_all["entry_date"] == st.session_state.selected_date.isoformat())
                                & (df_all["status"] == "closed")]
 
@@ -532,7 +558,6 @@ if can_enter_data:
 
         # ---- All records ----
         with sub_records:
-            df_all = load_data()
             closed_df = df_all[df_all["status"] == "closed"]
             if closed_df.empty:
                 st.info("No records yet.")
@@ -581,7 +606,7 @@ if can_enter_data:
 # DASHBOARD (everyone) — live alert banner + 4 charts, gentle scrolling OK
 # ----------------------------------------------------------------------------
 with tab_dashboard:
-    df = load_data()
+    df = df_all
     open_df = df[df["status"] == "open"].copy()
 
     # ---- Live ongoing-issue alert banner ----
