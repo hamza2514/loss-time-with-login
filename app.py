@@ -150,32 +150,33 @@ def _logo_data_uri():
     return f"data:image/jpeg;base64,{b64}"
 
 
-def brand_header(center=False, unit=None):
-    """Single self-contained flex block: logo + wordmark. Avoids column-layout clipping.
-    `unit` is the active unit to display; pass None on the login screen (not chosen yet)."""
+def brand_header(center=False, unit=None, subtitle=None):
+    """Single self-contained flex block: logo + wordmark.
+    `unit` shows an 'Unit: X' line (used once logged in).
+    `subtitle` shows plain text instead (used on the login screen, unit not chosen yet).
+    Built as one single-line HTML string on purpose — a blank line inside an
+    unsafe_allow_html block makes Streamlit's markdown parser bail out of raw-HTML
+    mode partway through and print a stray closing tag as visible text."""
     logo_uri = _logo_data_uri()
     logo_html = f"<img src='{logo_uri}' style='height:52px; width:auto; flex-shrink:0;'/>" if logo_uri else ""
     justify = "center" if center else "flex-start"
-    unit_line = (
-        f"<div style='font-size:13px; color:#666; font-weight:600;'>Unit: {unit}</div>"
-        if unit else ""
+    if subtitle:
+        extra_line = f"<div style='font-size:13px; color:#666; font-weight:600;'>{subtitle}</div>"
+    elif unit:
+        extra_line = f"<div style='font-size:13px; color:#666; font-weight:600;'>Unit: {unit}</div>"
+    else:
+        extra_line = ""
+    html = (
+        f"<div style='display:flex; align-items:center; gap:16px; justify-content:{justify}; padding:4px 0 10px 0;'>"
+        f"{logo_html}"
+        f"<div style='line-height:1.35;'>"
+        f"<div style='font-size:12px; letter-spacing:1.5px; color:{PALETTE['gray']}; font-weight:700; text-transform:uppercase;'>{COMPANY_NAME}</div>"
+        f"<div style='font-size:23px; font-weight:800; color:{PALETTE['navy']};'>Line Loss Time Tracker</div>"
+        f"{extra_line}"
+        f"</div>"
+        f"</div>"
     )
-    st.markdown(
-        f"""
-        <div style="display:flex; align-items:center; gap:16px; justify-content:{justify};
-                    padding:4px 0 10px 0;">
-            {logo_html}
-            <div style="line-height:1.35;">
-                <div style="font-size:12px; letter-spacing:1.5px; color:{PALETTE['gray']};
-                            font-weight:700; text-transform:uppercase;">{COMPANY_NAME}</div>
-                <div style="font-size:23px; font-weight:800; color:{PALETTE['navy']};">
-                    Line Loss Time Tracker</div>
-                {unit_line}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def fmt_ddmmyyyy(iso_str):
@@ -212,14 +213,24 @@ def load_auth_config():
 
 credentials, cookie_cfg = load_auth_config()
 
-authenticator = stauth.Authenticate(
+
+@st.cache_resource
+def get_authenticator(_credentials, cookie_name, cookie_key, expiry_days):
+    # Leading underscore on _credentials tells Streamlit not to hash this arg (it's a
+    # dict). Caching this means bcrypt only hashes every account's password once per
+    # app process, not on every single click/filter change — with 14+ accounts that
+    # repeated hashing was adding real, noticeable delay to every interaction.
+    return stauth.Authenticate(_credentials, cookie_name, cookie_key, expiry_days)
+
+
+authenticator = get_authenticator(
     credentials, cookie_cfg["name"], cookie_cfg["key"], cookie_cfg.get("expiry_days", 7),
 )
 
 if not st.session_state.get("authentication_status"):
     l1, l2, l3 = st.columns([1, 1.3, 1])
     with l2:
-        brand_header(center=True)
+        brand_header(center=True, subtitle="SBU AM-4A")
         st.write("")
         authenticator.login(location="main")
 
@@ -338,6 +349,7 @@ def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstati
         conn.commit()
     finally:
         release_conn(conn)
+    load_data.clear()
 
 
 def start_open_issue(line, category, reason, workstations_affected, recorded_by, unit):
@@ -354,6 +366,7 @@ def start_open_issue(line, category, reason, workstations_affected, recorded_by,
         conn.commit()
     finally:
         release_conn(conn)
+    load_data.clear()
 
 
 def resolve_issue(entry_id):
@@ -375,12 +388,21 @@ def resolve_issue(entry_id):
         conn.commit()
     finally:
         release_conn(conn)
+    load_data.clear()
 
 
-def load_data():
+@st.cache_data(ttl=15, show_spinner=False)
+def load_data(unit):
+    """Only pulls rows for the active unit (not the whole table), and caches the
+    result for a few seconds so ordinary reruns (typing, filters, switching tabs)
+    reuse it instead of hitting Neon every time. Writes below call load_data.clear()
+    so the very next rerun after a save always shows fresh data."""
     conn = get_conn()
     try:
-        df = pd.read_sql_query("SELECT * FROM loss_time ORDER BY id DESC", conn)
+        df = pd.read_sql_query(
+            "SELECT * FROM loss_time WHERE COALESCE(unit, %s) = %s ORDER BY id DESC",
+            conn, params=(DEFAULT_UNIT, unit),
+        )
     finally:
         release_conn(conn)
     return df
@@ -394,6 +416,7 @@ def delete_entry(entry_id):
         conn.commit()
     finally:
         release_conn(conn)
+    load_data.clear()
 
 
 
@@ -415,10 +438,10 @@ else:
     tab_entry = None
 
 # One query per page render, shared by every tab below (instead of each tab querying separately).
-# Scoped to the active unit here so every tab below (entry, today's log, all records,
-# dashboard) automatically only ever sees/writes data for that one unit.
-df_all = load_data()
-df_all = df_all[df_all["unit"].fillna(DEFAULT_UNIT) == active_unit]
+# Scoped to the active unit at the SQL level (and cached for a few seconds) so every
+# tab below (entry, today's log, all records, dashboard) only ever sees/writes data
+# for that one unit, and ordinary reruns don't re-hit the database each time.
+df_all = load_data(active_unit)
 
 # ----------------------------------------------------------------------------
 # DATA ENTRY (entry-role only)
