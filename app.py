@@ -214,16 +214,22 @@ def load_auth_config():
 credentials, cookie_cfg = load_auth_config()
 
 
-@st.cache_resource
-def get_authenticator(_credentials, cookie_name, cookie_key, expiry_days):
-    # Leading underscore on _credentials tells Streamlit not to hash this arg (it's a
-    # dict). Caching this means bcrypt only hashes every account's password once per
-    # app process, not on every single click/filter change — with 14+ accounts that
-    # repeated hashing was adding real, noticeable delay to every interaction.
-    return stauth.Authenticate(_credentials, cookie_name, cookie_key, expiry_days)
+@st.cache_data(show_spinner=False)
+def get_hashed_credentials(raw_credentials):
+    # Caching the Authenticate object itself (an earlier attempt) broke login: it
+    # creates a cookie-handling widget and sets up session_state internally, and both
+    # of those need to run fresh on every rerun, not just once. What's actually slow
+    # is bcrypt re-hashing every plain-text password on every single rerun — so cache
+    # just that (pure data, safe to cache), and build a new Authenticate() each rerun
+    # using the already-hashed result. Authenticate() skips re-hashing any password
+    # that's already a bcrypt hash, so this stays fast either way.
+    import copy
+    return stauth.Hasher.hash_passwords(copy.deepcopy(raw_credentials))
 
 
-authenticator = get_authenticator(
+credentials = get_hashed_credentials(credentials)
+
+authenticator = stauth.Authenticate(
     credentials, cookie_cfg["name"], cookie_cfg["key"], cookie_cfg.get("expiry_days", 7),
 )
 
