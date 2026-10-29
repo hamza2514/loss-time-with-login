@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import base64
 import yaml
 from yaml.loader import SafeLoader
@@ -43,8 +44,7 @@ st.set_page_config(page_title="Loss Time Tracker | Artistic Milliners", page_ico
 DATABASE_URL_SECRET = "DATABASE_URL"  # set this in Streamlit Secrets (Neon connection string)
 LOGO_PATH = "logo.jpg"
 COMPANY_NAME = "Artistic Milliners"
-ALL_UNITS = ["AM-4CT2", "AM-4A"]
-DEFAULT_UNIT = "AM-4CT2"  # fallback for any account whose config is missing a "units" list
+DEFAULT_UNIT = "AM-4CT2"  # legacy rows saved before units existed belong to this unit
 
 CATEGORIES = [
     "Trim Issues / Fabric Issue",
@@ -57,8 +57,6 @@ CATEGORIES = [
     "Line Discipline",
     "Other",
 ]
-
-LINES = [f"Line # {i}" for i in range(1, 7)]
 
 PALETTE = {
     "navy": "#1a3c6e",
@@ -191,92 +189,6 @@ def to_excel_bytes(df):
 
 
 # ----------------------------------------------------------------------------
-# AUTHENTICATION
-# ----------------------------------------------------------------------------
-def load_auth_config():
-    try:
-        has_secrets = "credentials" in st.secrets
-    except Exception:
-        has_secrets = False
-    if has_secrets:
-        credentials = {
-            "usernames": {u: dict(v) for u, v in st.secrets["credentials"]["usernames"].items()}
-        }
-        cookie = dict(st.secrets["cookie"])
-    else:
-        with open("auth_config.yaml") as f:
-            cfg = yaml.load(f, Loader=SafeLoader)
-        credentials = cfg["credentials"]
-        cookie = cfg["cookie"]
-    return credentials, cookie
-
-
-credentials, cookie_cfg = load_auth_config()
-
-
-@st.cache_data(show_spinner=False)
-def get_hashed_credentials(raw_credentials):
-    # Caching the Authenticate object itself (an earlier attempt) broke login: it
-    # creates a cookie-handling widget and sets up session_state internally, and both
-    # of those need to run fresh on every rerun, not just once. What's actually slow
-    # is bcrypt re-hashing every plain-text password on every single rerun — so cache
-    # just that (pure data, safe to cache), and build a new Authenticate() each rerun
-    # using the already-hashed result. Authenticate() skips re-hashing any password
-    # that's already a bcrypt hash, so this stays fast either way.
-    import copy
-    return stauth.Hasher.hash_passwords(copy.deepcopy(raw_credentials))
-
-
-credentials = get_hashed_credentials(credentials)
-
-authenticator = stauth.Authenticate(
-    credentials, cookie_cfg["name"], cookie_cfg["key"], cookie_cfg.get("expiry_days", 7),
-)
-
-if not st.session_state.get("authentication_status"):
-    l1, l2, l3 = st.columns([1, 1.3, 1])
-    with l2:
-        brand_header(center=True, subtitle="SBU AM-4A")
-        st.write("")
-        authenticator.login(location="main")
-
-auth_status = st.session_state.get("authentication_status")
-
-if auth_status is False:
-    st.error("Username or password is incorrect.")
-    st.stop()
-elif auth_status is None:
-    st.stop()
-
-username = st.session_state.get("username")
-display_name = st.session_state.get("name")
-user_cfg = credentials["usernames"].get(username, {})
-user_role = user_cfg.get("role", "viewer")
-can_enter_data = user_role == "entry"
-
-# Units this account is allowed to see. Missing "units" key -> single default unit
-# (keeps any old-style account config working without edits).
-allowed_units = user_cfg.get("units") or [DEFAULT_UNIT]
-allowed_units = [u for u in allowed_units if u in ALL_UNITS] or [DEFAULT_UNIT]
-
-with st.sidebar:
-    if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=60)
-    st.markdown(
-        f"<div style='font-size:11px; letter-spacing:1.5px; color:{PALETTE['gray']}; "
-        f"font-weight:700; text-transform:uppercase;'>{COMPANY_NAME}</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(f"**{display_name}**")
-
-    if len(allowed_units) > 1:
-        active_unit = st.selectbox("Active Unit", allowed_units, key="active_unit_select")
-    else:
-        active_unit = allowed_units[0]
-
-    authenticator.logout("Logout", "sidebar")
-
-# ----------------------------------------------------------------------------
 # DATABASE HELPERS  (Postgres / Neon) — pooled connections, schema set up once
 # ----------------------------------------------------------------------------
 def _database_url():
@@ -288,6 +200,73 @@ def _database_url():
             "(your Neon connection string) to this app's Secrets and reload."
         )
         st.stop()
+
+
+def _legacy_accounts():
+    """Old-style accounts from Secrets [credentials] (or local auth_config.yaml).
+    Only read once, to seed the database the first time the new version runs."""
+    try:
+        if "credentials" in st.secrets:
+            return {u: dict(v) for u, v in st.secrets["credentials"]["usernames"].items()}
+    except Exception:
+        pass
+    if os.path.exists("auth_config.yaml"):
+        with open("auth_config.yaml") as f:
+            cfg = yaml.load(f, Loader=SafeLoader) or {}
+        return (cfg.get("credentials") or {}).get("usernames") or {}
+    return {}
+
+
+def _admin_from_secrets():
+    try:
+        if "admin" in st.secrets:
+            a = dict(st.secrets["admin"])
+            if a.get("username") and a.get("password"):
+                return a
+    except Exception:
+        pass
+    return None
+
+
+def _seed_defaults(conn):
+    """One-time setup: default units/lines, existing accounts, and the admin account."""
+    def hash_pw(p):
+        p = str(p)
+        return p if stauth.Hasher.is_hash(p) else stauth.Hasher.hash(p)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM units")
+        if cur.fetchone()[0] == 0:
+            for u in ("AM-4CT2", "AM-4A"):
+                cur.execute("INSERT INTO units (name) VALUES (%s) ON CONFLICT DO NOTHING", (u,))
+                for i in range(1, 7):
+                    cur.execute("INSERT INTO lines (unit, name) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                                (u, f"Line # {i}"))
+
+        cur.execute("SELECT COUNT(*) FROM app_users")
+        if cur.fetchone()[0] == 0:
+            for uname, v in _legacy_accounts().items():
+                role = v.get("role", "viewer")
+                role = role if role in ("entry", "viewer") else "viewer"
+                units = list(v.get("units") or ["AM-4CT2"])
+                cur.execute(
+                    "INSERT INTO app_users (username, name, password_hash, role, units) "
+                    "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (username) DO NOTHING",
+                    (str(uname).lower(), v.get("name", uname), hash_pw(v.get("password", "")), role, units),
+                )
+
+        cur.execute("SELECT COUNT(*) FROM app_users WHERE role='admin'")
+        if cur.fetchone()[0] == 0:
+            a = _admin_from_secrets()
+            if a:
+                cur.execute(
+                    "INSERT INTO app_users (username, name, password_hash, role, units, active) "
+                    "VALUES (%s,%s,%s,'admin','{}',TRUE) "
+                    "ON CONFLICT (username) DO UPDATE SET role='admin', name=EXCLUDED.name, "
+                    "password_hash=EXCLUDED.password_hash, units='{}', active=TRUE",
+                    (str(a["username"]).lower(), a.get("name", a["username"]), hash_pw(a["password"])),
+                )
+    conn.commit()
 
 
 @st.cache_resource
@@ -325,7 +304,15 @@ def get_pool():
                 "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS unit TEXT DEFAULT 'AM-4CT2'",
             ]:
                 cur.execute(ddl)
+            cur.execute("CREATE TABLE IF NOT EXISTS units (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE)")
+            cur.execute("CREATE TABLE IF NOT EXISTS lines (id SERIAL PRIMARY KEY, unit TEXT NOT NULL, name TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, UNIQUE (unit, name))")
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS app_users (username TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                "password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', units TEXT[] NOT NULL DEFAULT '{}', "
+                "active BOOLEAN NOT NULL DEFAULT TRUE)"
+            )
         conn.commit()
+        _seed_defaults(conn)
     finally:
         p.putconn(conn)
     return p
@@ -426,6 +413,381 @@ def delete_entry(entry_id):
 
 
 
+# ----------------------------------------------------------------------------
+# USERS / UNITS / LINES  (stored in the database — managed from the Admin tab)
+# ----------------------------------------------------------------------------
+USERNAME_RE = re.compile(r"^[a-z0-9_.-]{3,30}$")
+MIN_PASSWORD_LEN = 6
+
+
+def db_query(sql, params=None):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    finally:
+        release_conn(conn)
+
+
+def db_run(sql, params=None):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_auth_users():
+    """Active accounts in the shape streamlit-authenticator expects. Passwords are
+    already bcrypt hashes in the DB, so nothing is hashed on rerun (fast)."""
+    rows = db_query("SELECT username, name, password_hash, role, units FROM app_users WHERE active")
+    return {"usernames": {
+        r[0]: {"name": r[1], "password": r[2], "role": r[3], "units": list(r[4] or [])} for r in rows
+    }}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_all_users():
+    rows = db_query("SELECT username, name, role, units, active FROM app_users ORDER BY (role <> 'admin'), role, username")
+    return [{"username": r[0], "name": r[1], "role": r[2], "units": list(r[3] or []), "active": r[4]} for r in rows]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_units():
+    rows = db_query("SELECT name, active FROM units ORDER BY id")
+    return [{"name": r[0], "active": r[1]} for r in rows]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_lines():
+    rows = db_query("SELECT unit, name, active FROM lines ORDER BY id")
+    return [{"unit": r[0], "name": r[1], "active": r[2]} for r in rows]
+
+
+def clear_admin_caches():
+    for fn in (load_auth_users, load_all_users, load_units, load_lines):
+        fn.clear()
+
+
+def lines_for(unit, only_active):
+    return [l["name"] for l in load_lines() if l["unit"] == unit and (l["active"] or not only_active)]
+
+
+def add_user(username, name, password, role, units):
+    """Returns an error string, or None on success."""
+    username = (username or "").strip().lower()
+    name = (name or "").strip()
+    if not USERNAME_RE.match(username):
+        return "Username must be 3–30 characters: lowercase letters, digits, dot, dash or underscore."
+    if not name:
+        return "Please enter the person's name."
+    if len(password or "") < MIN_PASSWORD_LEN:
+        return f"Password must be at least {MIN_PASSWORD_LEN} characters."
+    if role not in ("entry", "viewer"):
+        return "Invalid role."
+    if not units:
+        return "Please assign at least one unit."
+    if any(u["username"] == username for u in load_all_users()):
+        return "That username already exists."
+    try:
+        db_run(
+            "INSERT INTO app_users (username, name, password_hash, role, units) VALUES (%s,%s,%s,%s,%s)",
+            (username, name, stauth.Hasher.hash(password), role, list(units)),
+        )
+    except psycopg2.errors.UniqueViolation:
+        return "That username already exists."
+    clear_admin_caches()
+    return None
+
+
+def update_user(username, name, role, units, active, new_password=None):
+    if not (name or "").strip():
+        return "Name cannot be empty."
+    if new_password and len(new_password) < MIN_PASSWORD_LEN:
+        return f"New password must be at least {MIN_PASSWORD_LEN} characters."
+    if role != "admin" and not units:
+        return "Please assign at least one unit."
+    if role == "admin":
+        # admin: role/units/active are fixed (admin sees every unit, can't be locked out)
+        db_run("UPDATE app_users SET name=%s WHERE username=%s", (name.strip(), username))
+    else:
+        db_run(
+            "UPDATE app_users SET name=%s, role=%s, units=%s, active=%s WHERE username=%s",
+            (name.strip(), role, list(units), bool(active), username),
+        )
+    if new_password:
+        db_run("UPDATE app_users SET password_hash=%s WHERE username=%s",
+               (stauth.Hasher.hash(new_password), username))
+    clear_admin_caches()
+    return None
+
+
+def add_unit(name, n_lines):
+    name = (name or "").strip()
+    if not (2 <= len(name) <= 20):
+        return "Unit name must be 2–20 characters."
+    if any(u["name"].lower() == name.lower() for u in load_units()):
+        return "That unit already exists."
+    try:
+        db_run("INSERT INTO units (name) VALUES (%s)", (name,))
+    except psycopg2.errors.UniqueViolation:
+        return "That unit already exists."
+    for i in range(1, int(n_lines) + 1):
+        db_run("INSERT INTO lines (unit, name) VALUES (%s,%s) ON CONFLICT DO NOTHING", (name, f"Line # {i}"))
+    clear_admin_caches()
+    return None
+
+
+def set_unit_active(name, active):
+    db_run("UPDATE units SET active=%s WHERE name=%s", (bool(active), name))
+    clear_admin_caches()
+
+
+def add_line(unit, name):
+    name = (name or "").strip()
+    if not (1 <= len(name) <= 30):
+        return "Line name must be 1–30 characters."
+    if any(l["unit"] == unit and l["name"].lower() == name.lower() for l in load_lines()):
+        return "That line already exists in this unit."
+    try:
+        db_run("INSERT INTO lines (unit, name) VALUES (%s,%s)", (unit, name))
+    except psycopg2.errors.UniqueViolation:
+        return "That line already exists in this unit."
+    clear_admin_caches()
+    return None
+
+
+def set_line_active(unit, name, active):
+    db_run("UPDATE lines SET active=%s WHERE unit=%s AND name=%s", (bool(active), unit, name))
+    clear_admin_caches()
+
+
+def _flash(kind, msg):
+    st.session_state["_flash"] = (kind, msg)
+
+
+def render_admin():
+    """Admin-only page: users, units, lines."""
+    flash = st.session_state.pop("_flash", None)
+    if flash:
+        (st.success if flash[0] == "ok" else st.error)(flash[1])
+
+    units_all = load_units()
+    unit_names = [u["name"] for u in units_all]
+    active_unit_names = [u["name"] for u in units_all if u["active"]]
+    t_users, t_units, t_lines = st.tabs(["👥 Users", "🏭 Units", "📏 Lines"])
+
+    # ---------------- USERS ----------------
+    with t_users:
+        section_header("Add User", PALETTE["teal"], "➕")
+        ctr = st.session_state.setdefault("_au_ctr", 0)
+        with st.form(f"add_user_form_{ctr}"):
+            a1, a2 = st.columns(2)
+            with a1:
+                n_username = st.text_input("Username (login)", placeholder="e.g. ayesha")
+                n_password = st.text_input("Password", type="password")
+            with a2:
+                n_name = st.text_input("Full name (shown in the app)")
+                n_role = st.selectbox(
+                    "Access", ["entry", "viewer"],
+                    format_func=lambda r: "Data entry + Dashboard" if r == "entry" else "Dashboard only",
+                )
+            n_units = st.multiselect("Units this user can access", active_unit_names)
+            if st.form_submit_button("Add User", type="primary"):
+                err = add_user(n_username, n_name, n_password, n_role, n_units)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state["_au_ctr"] = ctr + 1
+                    _flash("ok", f"User '{n_username.strip().lower()}' added. Share the password with them directly — it can't be viewed later.")
+                    st.rerun()
+
+        section_header("Existing Users", PALETTE["navy"], "👥")
+        for u in load_all_users():
+            is_admin_row = u["role"] == "admin"
+            status = "" if u["active"] else "  ·  ⛔ inactive"
+            units_txt = "all units" if is_admin_row else ", ".join(u["units"]) or "no units"
+            with st.expander(f"{u['username']}  —  {u['name']}  ·  {u['role']}  ·  {units_txt}{status}"):
+                with st.form(f"uf_{u['username']}"):
+                    e1, e2 = st.columns(2)
+                    with e1:
+                        e_name = st.text_input("Full name", value=u["name"])
+                        e_pw = st.text_input("New password (leave blank to keep current)", type="password")
+                    with e2:
+                        if is_admin_row:
+                            st.caption("Admin account: always has access to every unit and can't be deactivated.")
+                            e_role, e_units, e_active = "admin", [], True
+                        else:
+                            e_role = st.selectbox(
+                                "Access", ["entry", "viewer"], index=0 if u["role"] == "entry" else 1,
+                                format_func=lambda r: "Data entry + Dashboard" if r == "entry" else "Dashboard only",
+                            )
+                            e_units = st.multiselect(
+                                "Units", unit_names, default=[x for x in u["units"] if x in unit_names],
+                            )
+                            e_active = st.checkbox("Account active", value=u["active"])
+                    if st.form_submit_button("Save changes"):
+                        err = update_user(u["username"], e_name, e_role, e_units, e_active, e_pw or None)
+                        if err:
+                            st.error(err)
+                        else:
+                            _flash("ok", f"Saved changes for '{u['username']}'.")
+                            st.rerun()
+
+    # ---------------- UNITS ----------------
+    with t_units:
+        section_header("Add Unit", PALETTE["teal"], "➕")
+        uctr = st.session_state.setdefault("_unit_ctr", 0)
+        with st.form(f"add_unit_form_{uctr}"):
+            b1, b2 = st.columns(2)
+            with b1:
+                nu_name = st.text_input("Unit name", placeholder="e.g. AM-15B")
+            with b2:
+                nu_lines = st.number_input("Create this many lines now (Line # 1 … N)", min_value=0, max_value=60, value=6, step=1)
+            if st.form_submit_button("Add Unit", type="primary"):
+                err = add_unit(nu_name, nu_lines)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state["_unit_ctr"] = uctr + 1
+                    _flash("ok", f"Unit '{nu_name.strip()}' added. Assign users to it from the Users tab.")
+                    st.rerun()
+
+        section_header("Existing Units", PALETTE["navy"], "🏭")
+        st.caption("Units can be deactivated (hidden from everyone but kept in history) — not deleted, so past records stay intact.")
+        for u in units_all:
+            n_act = len(lines_for(u["name"], True))
+            r1, r2, r3 = st.columns([3, 2, 2])
+            r1.markdown(f"**{u['name']}**  ·  {n_act} active line{'s' if n_act != 1 else ''}")
+            r2.markdown("🟢 Active" if u["active"] else "⛔ Inactive")
+            if r3.button("Deactivate" if u["active"] else "Reactivate", key=f"ut_{u['name']}"):
+                set_unit_active(u["name"], not u["active"])
+                _flash("ok", f"Unit '{u['name']}' {'deactivated' if u['active'] else 'reactivated'}.")
+                st.rerun()
+
+    # ---------------- LINES ----------------
+    with t_lines:
+        if not unit_names:
+            st.info("Add a unit first.")
+        else:
+            sel_unit = st.selectbox("Unit", unit_names, key="admin_line_unit")
+            unit_lines = [l for l in load_lines() if l["unit"] == sel_unit]
+
+            section_header(f"Add Line to {sel_unit}", PALETTE["teal"], "➕")
+            with st.form(f"add_line_form_{sel_unit}_{len(unit_lines)}"):
+                nl_name = st.text_input("Line name", value=f"Line # {len(unit_lines) + 1}")
+                if st.form_submit_button("Add Line", type="primary"):
+                    err = add_line(sel_unit, nl_name)
+                    if err:
+                        st.error(err)
+                    else:
+                        _flash("ok", f"'{nl_name.strip()}' added to {sel_unit}.")
+                        st.rerun()
+
+            section_header(f"Lines in {sel_unit}", PALETTE["navy"], "📏")
+            st.caption("Deactivated lines disappear from the entry forms but stay in dashboards and records.")
+            if not unit_lines:
+                st.info("No lines yet for this unit.")
+            for l in unit_lines:
+                r1, r2, r3 = st.columns([3, 2, 2])
+                r1.markdown(f"**{l['name']}**")
+                r2.markdown("🟢 Active" if l["active"] else "⛔ Inactive")
+                if r3.button("Deactivate" if l["active"] else "Reactivate", key=f"lt_{sel_unit}_{l['name']}"):
+                    set_line_active(sel_unit, l["name"], not l["active"])
+                    _flash("ok", f"'{l['name']}' {'deactivated' if l['active'] else 'reactivated'}.")
+                    st.rerun()
+
+
+# ----------------------------------------------------------------------------
+# AUTHENTICATION  (accounts live in the database; see Admin tab)
+# ----------------------------------------------------------------------------
+def load_cookie_cfg():
+    try:
+        if "cookie" in st.secrets:
+            return dict(st.secrets["cookie"])
+    except Exception:
+        pass
+    if os.path.exists("auth_config.yaml"):
+        with open("auth_config.yaml") as f:
+            return yaml.load(f, Loader=SafeLoader)["cookie"]
+    st.error("No [cookie] section found in Secrets.")
+    st.stop()
+
+
+cookie_cfg = load_cookie_cfg()
+credentials = load_auth_users()  # cached; passwords are already bcrypt hashes -> no hashing per rerun
+
+authenticator = stauth.Authenticate(
+    credentials, cookie_cfg["name"], cookie_cfg["key"], cookie_cfg.get("expiry_days", 7),
+)
+
+if not st.session_state.get("authentication_status"):
+    l1, l2, l3 = st.columns([1, 1.3, 1])
+    with l2:
+        brand_header(center=True, subtitle="SBU AM-4A")
+        st.write("")
+        authenticator.login(location="main")
+
+auth_status = st.session_state.get("authentication_status")
+
+if auth_status is False:
+    st.error("Username or password is incorrect.")
+    st.stop()
+elif auth_status is None:
+    st.stop()
+
+username = st.session_state.get("username")
+display_name = st.session_state.get("name")
+user_cfg = credentials["usernames"].get(username, {})
+user_role = user_cfg.get("role", "viewer")
+is_admin = user_role == "admin"
+can_enter_data = user_role in ("entry", "admin")
+
+# Units this account may see: admin = every active unit; others = their assigned active units.
+_active_units = [u["name"] for u in load_units() if u["active"]]
+if is_admin:
+    allowed_units = _active_units
+else:
+    allowed_units = [u for u in (user_cfg.get("units") or []) if u in _active_units]
+
+with st.sidebar:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=60)
+    st.markdown(
+        f"<div style='font-size:11px; letter-spacing:1.5px; color:{PALETTE['gray']}; "
+        f"font-weight:700; text-transform:uppercase;'>{COMPANY_NAME}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"**{display_name}**")
+
+    if len(allowed_units) > 1:
+        active_unit = st.selectbox("Active Unit", allowed_units, key="active_unit_select")
+    elif allowed_units:
+        active_unit = allowed_units[0]
+    else:
+        active_unit = None
+
+    authenticator.logout("Logout", "sidebar")
+
+if active_unit is None:
+    brand_header()
+    if is_admin:
+        st.warning("No active units yet. Add one below.")
+        render_admin()
+    else:
+        st.warning("No unit is assigned to your account yet. Please contact the admin.")
+    st.stop()
+
+active_lines = lines_for(active_unit, True)    # shown in entry forms
+all_lines = lines_for(active_unit, False)      # used for filters/charts (keeps history of retired lines)
+
 if "selected_date" not in st.session_state:
     st.session_state.selected_date = today_pkt()
 
@@ -437,11 +799,15 @@ st_autorefresh(interval=30 * 60_000, key="global_refresh")  # refresh only every
 brand_header(unit=active_unit)
 st.markdown("<hr style='margin-top:2px; margin-bottom:10px;'>", unsafe_allow_html=True)
 
-if can_enter_data:
-    tab_entry, tab_dashboard = st.tabs(["📝 Data Entry", "📊 Dashboard"])
-else:
-    tab_dashboard = st.container()
-    tab_entry = None
+_labels = (["📝 Data Entry"] if can_enter_data else []) + ["📊 Dashboard"] + (["⚙️ Admin"] if is_admin else [])
+_tabs = iter([st.container()] if len(_labels) == 1 else st.tabs(_labels))
+tab_entry = next(_tabs) if can_enter_data else None
+tab_dashboard = next(_tabs)
+tab_admin = next(_tabs) if is_admin else None
+
+if is_admin:
+    with tab_admin:
+        render_admin()
 
 # One query per page render, shared by every tab below (instead of each tab querying separately).
 # Scoped to the active unit at the SQL level (and cached for a few seconds) so every
@@ -477,7 +843,7 @@ if can_enter_data:
 
             c1, c2 = st.columns(2)
             with c1:
-                line = st.selectbox("Select Line", LINES, key=f"line_{fk}")
+                line = st.selectbox("Select Line", active_lines, key=f"line_{fk}")
             with c2:
                 category = st.selectbox("Select Reason Category", CATEGORIES, key=f"category_{fk}")
             reason = st.text_area("Detailed Reason", height=80, key=f"reason_{fk}",
@@ -507,7 +873,9 @@ if can_enter_data:
                 st.caption("Total Minutes Lost will be calculated here once both fields above are filled in.")
 
             if st.button("Submit", use_container_width=True, type="primary", key=f"submit_btn_{fk}"):
-                if minutes_lost is None or minutes_lost <= 0:
+                if not line:
+                    st.error("No line is set up for this unit yet. Please ask the admin to add lines.")
+                elif minutes_lost is None or minutes_lost <= 0:
                     st.error("Please enter minutes lost greater than 0.")
                 elif workstations_affected is None or workstations_affected < 1:
                     st.error("Please enter the number of work-stations affected.")
@@ -532,7 +900,7 @@ if can_enter_data:
             with st.form("start_form", clear_on_submit=True):
                 c1, c2 = st.columns(2)
                 with c1:
-                    o_line = st.selectbox("Select Line", LINES, key="o_line")
+                    o_line = st.selectbox("Select Line", active_lines, key="o_line")
                 with c2:
                     o_category = st.selectbox("Select Reason Category", CATEGORIES, key="o_cat")
                 o_reason = st.text_area("Detailed Reason", height=70, key="o_reason",
@@ -543,7 +911,9 @@ if can_enter_data:
                 )
                 start_submitted = st.form_submit_button("🔴 Start Issue", use_container_width=True, type="primary")
                 if start_submitted:
-                    if not o_reason.strip():
+                    if not o_line:
+                        st.error("No line is set up for this unit yet. Please ask the admin to add lines.")
+                    elif not o_reason.strip():
                         st.error("Please enter a detailed reason.")
                     elif o_workstations is None or o_workstations < 1:
                         st.error("Please enter the number of work-stations affected.")
@@ -625,7 +995,7 @@ if can_enter_data:
                 with rf1:
                     rdate = st.multiselect("Date", list(date_label_map.keys()), key="rec_date")
                 with rf2:
-                    rline = st.multiselect("Line", LINES, key="rec_line")
+                    rline = st.multiselect("Line", all_lines, key="rec_line")
                 with rf3:
                     rcat = st.multiselect("Category", CATEGORIES, key="rec_cat")
 
@@ -704,7 +1074,7 @@ with tab_dashboard:
                 format="DD-MM-YYYY", key="dash_date_range",
             )
         with fc2:
-            line_filter = st.multiselect("Filter by Line", LINES)
+            line_filter = st.multiselect("Filter by Line", all_lines)
         with fc3:
             category_filter = st.multiselect("Filter by Category", CATEGORIES)
 
@@ -737,7 +1107,8 @@ with tab_dashboard:
             r1c1, r1c2 = st.columns(2)
             with r1c1:
                 section_header("Line-wise Lost Minutes", PALETTE["sky"], "📶")
-                line_agg = fdf.groupby("line")["minutes"].sum().reindex(LINES).fillna(0).reset_index()
+                chart_lines = all_lines + sorted(set(fdf["line"]) - set(all_lines))
+                line_agg = fdf.groupby("line")["minutes"].sum().reindex(chart_lines).fillna(0).reset_index()
                 fig = px.bar(line_agg, x="line", y="minutes", text_auto=".0f", color="line",
                              color_discrete_sequence=px.colors.qualitative.Set2)
                 fig.update_traces(marker_line_width=0, textfont_size=12)
