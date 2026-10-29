@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 import base64
 import yaml
 from yaml.loader import SafeLoader
@@ -202,38 +203,11 @@ def _database_url():
         st.stop()
 
 
-def _legacy_accounts():
-    """Old-style accounts from Secrets [credentials] (or local auth_config.yaml).
-    Only read once, to seed the database the first time the new version runs."""
-    try:
-        if "credentials" in st.secrets:
-            return {u: dict(v) for u, v in st.secrets["credentials"]["usernames"].items()}
-    except Exception:
-        pass
-    if os.path.exists("auth_config.yaml"):
-        with open("auth_config.yaml") as f:
-            cfg = yaml.load(f, Loader=SafeLoader) or {}
-        return (cfg.get("credentials") or {}).get("usernames") or {}
-    return {}
-
-
-def _admin_from_secrets():
-    try:
-        if "admin" in st.secrets:
-            a = dict(st.secrets["admin"])
-            if a.get("username") and a.get("password"):
-                return a
-    except Exception:
-        pass
-    return None
-
-
 def _seed_defaults(conn):
-    """One-time setup: default units/lines, existing accounts, and the admin account."""
-    def hash_pw(p):
-        p = str(p)
-        return p if stauth.Hasher.is_hash(p) else stauth.Hasher.hash(p)
-
+    """One-time setup, safe to repeat. NEVER touches the loss_time table.
+    - Default units/lines are created only if the units table is empty (plus any
+      unit/line already used by existing records, so old data always lines up).
+    - One-time reset of the user list (accounts are now created from the app itself)."""
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM units")
         if cur.fetchone()[0] == 0:
@@ -242,52 +216,25 @@ def _seed_defaults(conn):
                 for i in range(1, 7):
                     cur.execute("INSERT INTO lines (unit, name) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                                 (u, f"Line # {i}"))
+            cur.execute("INSERT INTO units (name) SELECT DISTINCT COALESCE(unit, 'AM-4CT2') FROM loss_time ON CONFLICT DO NOTHING")
+            cur.execute("INSERT INTO lines (unit, name) SELECT DISTINCT COALESCE(unit, 'AM-4CT2'), line FROM loss_time ON CONFLICT DO NOTHING")
 
-        cur.execute("SELECT COUNT(*) FROM app_users")
-        if cur.fetchone()[0] == 0:
-            for uname, v in _legacy_accounts().items():
-                role = v.get("role", "viewer")
-                role = role if role in ("entry", "viewer") else "viewer"
-                units = list(v.get("units") or ["AM-4CT2"])
-                cur.execute(
-                    "INSERT INTO app_users (username, name, password_hash, role, units) "
-                    "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (username) DO NOTHING",
-                    (str(uname).lower(), v.get("name", uname), hash_pw(v.get("password", "")), role, units),
-                )
-
+        cur.execute("SELECT 1 FROM app_meta WHERE key='users_reset_v1'")
+        if not cur.fetchone():
+            cur.execute("DELETE FROM app_users")      # accounts only — records are not touched
+            cur.execute("INSERT INTO app_meta (key, value) VALUES ('users_reset_v1', 'done')")
     conn.commit()
-    _ensure_admin(conn)
-
-
-def _ensure_admin(conn):
-    """Create the admin from Secrets [admin] if no admin exists yet. If that username
-    already exists (e.g. your old 'hamza' account) it is upgraded to admin.
-    Returns True if it created/upgraded one."""
-    a = _admin_from_secrets()
-    if not a:
-        return False
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM app_users WHERE role='admin' LIMIT 1")
-        if cur.fetchone():
-            return False
-        pw = str(a["password"])
-        cur.execute(
-            "INSERT INTO app_users (username, name, password_hash, role, units, active) "
-            "VALUES (%s,%s,%s,'admin','{}',TRUE) "
-            "ON CONFLICT (username) DO UPDATE SET role='admin', name=EXCLUDED.name, "
-            "password_hash=EXCLUDED.password_hash, units='{}', active=TRUE",
-            (str(a["username"]).lower(), a.get("name", a["username"]),
-             pw if stauth.Hasher.is_hash(pw) else stauth.Hasher.hash(pw)),
-        )
-    conn.commit()
-    return True
 
 
 @st.cache_resource
 def get_pool():
     """One pooled set of connections, reused across reruns and sessions —
     avoids a fresh network handshake to Neon on every single query."""
-    p = psycopg2.pool.ThreadedConnectionPool(1, 10, _database_url())
+    p = psycopg2.pool.ThreadedConnectionPool(
+        1, 10, _database_url(),
+        connect_timeout=15, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+    )
+    p.last_used = {}   # id(conn) -> time it was last handed back (used to spot stale connections)
     conn = p.getconn()
     try:
         with conn.cursor() as cur:
@@ -325,6 +272,7 @@ def get_pool():
                 "password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', units TEXT[] NOT NULL DEFAULT '{}', "
                 "active BOOLEAN NOT NULL DEFAULT TRUE)"
             )
+            cur.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
         _seed_defaults(conn)
     finally:
@@ -332,12 +280,41 @@ def get_pool():
     return p
 
 
+STALE_AFTER_SECONDS = 20
+
+
 def get_conn():
-    return get_pool().getconn()
+    """Hand out a connection that is known to be alive. Neon puts idle databases to
+    sleep, which silently kills pooled connections; a connection that has been idle
+    a while gets a quick ping, and a dead one is thrown away and replaced."""
+    pool = get_pool()
+    last_error = None
+    for _ in range(4):
+        conn = None
+        try:
+            conn = pool.getconn()
+            if conn.closed:
+                raise psycopg2.InterfaceError("connection closed")
+            if time.time() - pool.last_used.get(id(conn), 0) > STALE_AFTER_SECONDS:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                conn.rollback()
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            last_error = e
+            if conn is not None:
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+            time.sleep(0.8)   # also covers Neon waking up from sleep
+    raise last_error
 
 
 def release_conn(conn):
-    get_pool().putconn(conn)
+    pool = get_pool()
+    pool.last_used[id(conn)] = time.time()
+    pool.putconn(conn)
 
 
 def add_closed_entry(entry_date, line, category, reason, minutes_lost, workstations_affected, recorded_by, unit):
@@ -490,17 +467,55 @@ def clear_admin_caches():
         fn.clear()
 
 
-def ensure_admin_account():
-    """Runs only while no admin exists: picks up a newly added Secrets [admin]
-    without needing the app to restart."""
+def admin_exists():
+    return bool(db_query("SELECT 1 FROM app_users WHERE role='admin' LIMIT 1"))
+
+
+def create_first_admin(name, username, password, confirm):
+    """First-time setup only: succeeds only while no admin exists. Returns error or None."""
+    username = (username or "").strip().lower()
+    if not (name or "").strip():
+        return "Please enter your name."
+    if not USERNAME_RE.match(username):
+        return "Username must be 3–30 characters: lowercase letters, digits, dot, dash or underscore."
+    if len(password or "") < MIN_PASSWORD_LEN:
+        return f"Password must be at least {MIN_PASSWORD_LEN} characters."
+    if password != confirm:
+        return "Passwords do not match."
     conn = get_conn()
     try:
-        created = _ensure_admin(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_users (username, name, password_hash, role, units, active) "
+                "SELECT %s, %s, %s, 'admin', '{}', TRUE "
+                "WHERE NOT EXISTS (SELECT 1 FROM app_users WHERE role='admin')",
+                (username, name.strip(), stauth.Hasher.hash(password)),
+            )
+            created = cur.rowcount == 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_conn(conn)
-    if created:
-        clear_admin_caches()
-    return created
+    clear_admin_caches()
+    return None if created else "An admin account already exists."
+
+
+def render_first_run_setup():
+    st.info("First-time setup: create the admin account. You'll use it to add users, units and lines.")
+    with st.form("first_admin_form"):
+        f_name = st.text_input("Your full name")
+        f_user = st.text_input("Admin username", placeholder="e.g. hamza")
+        f_pw = st.text_input("Password", type="password")
+        f_pw2 = st.text_input("Confirm password", type="password")
+        if st.form_submit_button("Create Admin Account", type="primary"):
+            err = create_first_admin(f_name, f_user, f_pw, f_pw2)
+            if err:
+                st.error(err)
+            else:
+                _flash("ok", "Admin account created. Please log in.")
+                st.rerun()
 
 
 def lines_for(unit, only_active):
@@ -750,7 +765,16 @@ def load_cookie_cfg():
 
 cookie_cfg = load_cookie_cfg()
 credentials = load_auth_users()  # cached; passwords are already bcrypt hashes -> no hashing per rerun
-if not any(v.get("role") == "admin" for v in credentials["usernames"].values()) and ensure_admin_account():
+if not any(v.get("role") == "admin" for v in credentials["usernames"].values()):
+    # Cached list shows no admin: check the database itself (only happens until one exists).
+    if not admin_exists():
+        s1, s2, s3 = st.columns([1, 1.3, 1])
+        with s2:
+            brand_header(center=True, subtitle="SBU AM-4A")
+            st.write("")
+            render_first_run_setup()
+        st.stop()
+    clear_admin_caches()
     credentials = load_auth_users()
 
 authenticator = stauth.Authenticate(
@@ -762,6 +786,9 @@ if not st.session_state.get("authentication_status"):
     with l2:
         brand_header(center=True, subtitle="SBU AM-4A")
         st.write("")
+        _fl = st.session_state.pop("_flash", None)
+        if _fl:
+            st.success(_fl[1])
         authenticator.login(location="main")
 
 auth_status = st.session_state.get("authentication_status")
