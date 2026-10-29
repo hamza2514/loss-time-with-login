@@ -255,18 +255,32 @@ def _seed_defaults(conn):
                     (str(uname).lower(), v.get("name", uname), hash_pw(v.get("password", "")), role, units),
                 )
 
-        cur.execute("SELECT COUNT(*) FROM app_users WHERE role='admin'")
-        if cur.fetchone()[0] == 0:
-            a = _admin_from_secrets()
-            if a:
-                cur.execute(
-                    "INSERT INTO app_users (username, name, password_hash, role, units, active) "
-                    "VALUES (%s,%s,%s,'admin','{}',TRUE) "
-                    "ON CONFLICT (username) DO UPDATE SET role='admin', name=EXCLUDED.name, "
-                    "password_hash=EXCLUDED.password_hash, units='{}', active=TRUE",
-                    (str(a["username"]).lower(), a.get("name", a["username"]), hash_pw(a["password"])),
-                )
     conn.commit()
+    _ensure_admin(conn)
+
+
+def _ensure_admin(conn):
+    """Create the admin from Secrets [admin] if no admin exists yet. If that username
+    already exists (e.g. your old 'hamza' account) it is upgraded to admin.
+    Returns True if it created/upgraded one."""
+    a = _admin_from_secrets()
+    if not a:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM app_users WHERE role='admin' LIMIT 1")
+        if cur.fetchone():
+            return False
+        pw = str(a["password"])
+        cur.execute(
+            "INSERT INTO app_users (username, name, password_hash, role, units, active) "
+            "VALUES (%s,%s,%s,'admin','{}',TRUE) "
+            "ON CONFLICT (username) DO UPDATE SET role='admin', name=EXCLUDED.name, "
+            "password_hash=EXCLUDED.password_hash, units='{}', active=TRUE",
+            (str(a["username"]).lower(), a.get("name", a["username"]),
+             pw if stauth.Hasher.is_hash(pw) else stauth.Hasher.hash(pw)),
+        )
+    conn.commit()
+    return True
 
 
 @st.cache_resource
@@ -474,6 +488,19 @@ def load_lines():
 def clear_admin_caches():
     for fn in (load_auth_users, load_all_users, load_units, load_lines):
         fn.clear()
+
+
+def ensure_admin_account():
+    """Runs only while no admin exists: picks up a newly added Secrets [admin]
+    without needing the app to restart."""
+    conn = get_conn()
+    try:
+        created = _ensure_admin(conn)
+    finally:
+        release_conn(conn)
+    if created:
+        clear_admin_caches()
+    return created
 
 
 def lines_for(unit, only_active):
@@ -723,6 +750,8 @@ def load_cookie_cfg():
 
 cookie_cfg = load_cookie_cfg()
 credentials = load_auth_users()  # cached; passwords are already bcrypt hashes -> no hashing per rerun
+if not any(v.get("role") == "admin" for v in credentials["usernames"].values()) and ensure_admin_account():
+    credentials = load_auth_users()
 
 authenticator = stauth.Authenticate(
     credentials, cookie_cfg["name"], cookie_cfg["key"], cookie_cfg.get("expiry_days", 7),
