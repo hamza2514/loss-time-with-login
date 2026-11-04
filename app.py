@@ -182,10 +182,20 @@ def fmt_ddmmyyyy(iso_str):
     return datetime.strptime(iso_str, "%Y-%m-%d").strftime("%d-%m-%Y")
 
 
+@st.cache_data(show_spinner=False, max_entries=6)
 def to_excel_bytes(df):
+    """Cached on the table's contents, so it is only rebuilt when the data actually
+    changes (not on every click). Uses openpyxl's streaming writer, several times
+    faster than pandas.to_excel."""
+    from openpyxl import Workbook
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Loss Time Data")
+    ws.append([str(c) for c in df.columns])
+    clean = df.astype(object).where(df.notna(), None)
+    for row in clean.itertuples(index=False, name=None):
+        ws.append(list(row))
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Loss Time Data")
+    wb.save(buf)
     return buf.getvalue()
 
 
@@ -203,33 +213,47 @@ def _database_url():
         st.stop()
 
 
-def _seed_defaults(conn):
-    """One-time setup, safe to repeat. NEVER touches the loss_time table.
-    - Default units/lines are created only if the units table is empty (plus any
-      unit/line already used by existing records, so old data always lines up).
-    - One-time reset of the user list (accounts are now created from the app itself)."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM units")
-        if cur.fetchone()[0] == 0:
-            for u in ("AM-4CT2", "AM-4A"):
-                cur.execute("INSERT INTO units (name) VALUES (%s) ON CONFLICT DO NOTHING", (u,))
-                for i in range(1, 7):
-                    cur.execute("INSERT INTO lines (unit, name) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                                (u, f"Line # {i}"))
-            cur.execute("INSERT INTO units (name) SELECT DISTINCT COALESCE(unit, 'AM-4CT2') FROM loss_time ON CONFLICT DO NOTHING")
-            cur.execute("INSERT INTO lines (unit, name) SELECT DISTINCT COALESCE(unit, 'AM-4CT2'), line FROM loss_time ON CONFLICT DO NOTHING")
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS loss_time (
+    id SERIAL PRIMARY KEY, entry_date TEXT NOT NULL, line TEXT NOT NULL, category TEXT NOT NULL,
+    reason TEXT, minutes REAL, recorded_at TEXT NOT NULL, recorded_by TEXT,
+    status TEXT DEFAULT 'closed', start_time TEXT, end_time TEXT
+);
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS recorded_by TEXT;
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'closed';
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS start_time TEXT;
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT;
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS minutes_lost REAL;
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS workstations_affected REAL;
+ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS unit TEXT DEFAULT 'AM-4CT2';
+CREATE TABLE IF NOT EXISTS units (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE);
+CREATE TABLE IF NOT EXISTS lines (id SERIAL PRIMARY KEY, unit TEXT NOT NULL, name TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, UNIQUE (unit, name));
+CREATE TABLE IF NOT EXISTS app_users (username TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'viewer', units TEXT[] NOT NULL DEFAULT '{}', active BOOLEAN NOT NULL DEFAULT TRUE);
+CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT);
+SELECT (SELECT COUNT(*) FROM units), EXISTS (SELECT 1 FROM app_meta WHERE key = 'users_reset_v1');
+"""
 
-        cur.execute("SELECT 1 FROM app_meta WHERE key='users_reset_v1'")
-        if not cur.fetchone():
-            cur.execute("DELETE FROM app_users")      # accounts only — records are not touched
-            cur.execute("INSERT INTO app_meta (key, value) VALUES ('users_reset_v1', 'done')")
-    conn.commit()
+SEED_UNITS_SQL = """
+INSERT INTO units (name) VALUES ('AM-4CT2'), ('AM-4A') ON CONFLICT DO NOTHING;
+INSERT INTO lines (unit, name) SELECT v.u, 'Line # ' || g FROM (VALUES ('AM-4CT2'), ('AM-4A')) v(u), generate_series(1, 6) g ON CONFLICT DO NOTHING;
+INSERT INTO units (name) SELECT DISTINCT COALESCE(unit, 'AM-4CT2') FROM loss_time ON CONFLICT DO NOTHING;
+INSERT INTO lines (unit, name) SELECT DISTINCT COALESCE(unit, 'AM-4CT2'), line FROM loss_time ON CONFLICT DO NOTHING;
+"""
+
+# One-time reset of the user list (accounts are now created from the app itself).
+# Touches app_users only — never the loss_time records.
+RESET_USERS_SQL = """
+DELETE FROM app_users;
+INSERT INTO app_meta (key, value) VALUES ('users_reset_v1', 'done') ON CONFLICT DO NOTHING;
+"""
 
 
 @st.cache_resource
 def get_pool():
     """One pooled set of connections, reused across reruns and sessions —
-    avoids a fresh network handshake to Neon on every single query."""
+    avoids a fresh network handshake to Neon on every single query.
+    Startup does its schema check in a single round trip."""
     p = psycopg2.pool.ThreadedConnectionPool(
         1, 10, _database_url(),
         connect_timeout=15, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
@@ -237,50 +261,20 @@ def get_pool():
     p.last_used = {}   # id(conn) -> time it was last handed back (used to spot stale connections)
     conn = p.getconn()
     try:
+        conn.autocommit = True        # whole script below runs as one implicit transaction
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS loss_time (
-                    id SERIAL PRIMARY KEY,
-                    entry_date TEXT NOT NULL,
-                    line TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    reason TEXT,
-                    minutes REAL,
-                    recorded_at TEXT NOT NULL,
-                    recorded_by TEXT,
-                    status TEXT DEFAULT 'closed',
-                    start_time TEXT,
-                    end_time TEXT
-                )
-                """
-            )
-            for ddl in [
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS recorded_by TEXT",
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'closed'",
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS start_time TEXT",
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS end_time TEXT",
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS minutes_lost REAL",
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS workstations_affected REAL",
-                "ALTER TABLE loss_time ADD COLUMN IF NOT EXISTS unit TEXT DEFAULT 'AM-4CT2'",
-            ]:
-                cur.execute(ddl)
-            cur.execute("CREATE TABLE IF NOT EXISTS units (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE)")
-            cur.execute("CREATE TABLE IF NOT EXISTS lines (id SERIAL PRIMARY KEY, unit TEXT NOT NULL, name TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, UNIQUE (unit, name))")
-            cur.execute(
-                "CREATE TABLE IF NOT EXISTS app_users (username TEXT PRIMARY KEY, name TEXT NOT NULL, "
-                "password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', units TEXT[] NOT NULL DEFAULT '{}', "
-                "active BOOLEAN NOT NULL DEFAULT TRUE)"
-            )
-            cur.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
-        conn.commit()
-        _seed_defaults(conn)
+            cur.execute(SCHEMA_SQL)
+            n_units, users_reset_done = cur.fetchone()
+            seed = (SEED_UNITS_SQL if n_units == 0 else "") + ("" if users_reset_done else RESET_USERS_SQL)
+            if seed:
+                cur.execute(seed)
+        conn.autocommit = False
     finally:
         p.putconn(conn)
     return p
 
 
-STALE_AFTER_SECONDS = 20
+STALE_AFTER_SECONDS = 90
 
 
 def get_conn():
@@ -375,10 +369,10 @@ def resolve_issue(entry_id):
     load_data.clear()
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_data(unit):
     """Only pulls rows for the active unit (not the whole table), and caches the
-    result for a few seconds so ordinary reruns (typing, filters, switching tabs)
+    result so ordinary reruns (typing, filters, switching tabs)
     reuse it instead of hitting Neon every time. Writes below call load_data.clear()
     so the very next rerun after a save always shows fresh data."""
     conn = get_conn()
@@ -411,60 +405,82 @@ USERNAME_RE = re.compile(r"^[a-z0-9_.-]{3,30}$")
 MIN_PASSWORD_LEN = 6
 
 
+def _db_exec(work):
+    """Run work(cursor) and commit. If the connection turns out to be dead (Neon woke
+    from sleep), throw it away and retry once on a fresh one."""
+    for attempt in (1, 2):
+        conn = get_conn()
+        broken = False
+        try:
+            with conn.cursor() as cur:
+                result = work(cur)
+            conn.commit()
+            return result
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            broken = True
+            if attempt == 2:
+                raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if broken:
+                get_pool().putconn(conn, close=True)
+            else:
+                release_conn(conn)
+
+
 def db_query(sql, params=None):
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-    finally:
-        release_conn(conn)
+    def work(cur):
+        cur.execute(sql, params)
+        return cur.fetchall()
+    return _db_exec(work)
 
 
 def db_run(sql, params=None):
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
+    _db_exec(lambda cur: cur.execute(sql, params))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _load_config():
+    """Users, units and lines fetched together in ONE database round trip."""
+    row = db_query(
+        """
+        SELECT
+          COALESCE((SELECT json_agg(json_build_object('username', username, 'name', name,
+                       'password', password_hash, 'role', role, 'units', to_json(units), 'active', active)
+                       ORDER BY (role <> 'admin'), role, username) FROM app_users), '[]'::json),
+          COALESCE((SELECT json_agg(json_build_object('name', name, 'active', active) ORDER BY id) FROM units), '[]'::json),
+          COALESCE((SELECT json_agg(json_build_object('unit', unit, 'name', name, 'active', active) ORDER BY id) FROM lines), '[]'::json)
+        """
+    )[0]
+    return {"users": row[0], "units": row[1], "lines": row[2]}
+
+
 def load_auth_users():
     """Active accounts in the shape streamlit-authenticator expects. Passwords are
     already bcrypt hashes in the DB, so nothing is hashed on rerun (fast)."""
-    rows = db_query("SELECT username, name, password_hash, role, units FROM app_users WHERE active")
     return {"usernames": {
-        r[0]: {"name": r[1], "password": r[2], "role": r[3], "units": list(r[4] or [])} for r in rows
+        u["username"]: {"name": u["name"], "password": u["password"], "role": u["role"], "units": list(u["units"] or [])}
+        for u in _load_config()["users"] if u["active"]
     }}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_all_users():
-    rows = db_query("SELECT username, name, role, units, active FROM app_users ORDER BY (role <> 'admin'), role, username")
-    return [{"username": r[0], "name": r[1], "role": r[2], "units": list(r[3] or []), "active": r[4]} for r in rows]
+    return [{"username": u["username"], "name": u["name"], "role": u["role"],
+             "units": list(u["units"] or []), "active": u["active"]} for u in _load_config()["users"]]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_units():
-    rows = db_query("SELECT name, active FROM units ORDER BY id")
-    return [{"name": r[0], "active": r[1]} for r in rows]
+    return _load_config()["units"]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_lines():
-    rows = db_query("SELECT unit, name, active FROM lines ORDER BY id")
-    return [{"unit": r[0], "name": r[1], "active": r[2]} for r in rows]
+    return _load_config()["lines"]
 
 
 def clear_admin_caches():
-    for fn in (load_auth_users, load_all_users, load_units, load_lines):
-        fn.clear()
+    _load_config.clear()
 
 
 def admin_exists():
@@ -1073,7 +1089,11 @@ if can_enter_data:
                     "minutes_lost": "Minutes Lost", "workstations_affected": "Work-stations Affected",
                     "minutes": "Total Minutes Lost",
                 })
-                st.dataframe(disp_all, use_container_width=True, hide_index=True, height=340)
+                SHOW_MAX = 500
+                if len(disp_all) > SHOW_MAX:
+                    st.caption(f"Showing the latest {SHOW_MAX} of {len(disp_all):,} records (use the filters above to narrow down). "
+                               "The Excel / CSV downloads below contain all of them.")
+                st.dataframe(disp_all.head(SHOW_MAX), use_container_width=True, hide_index=True, height=340)
 
                 dl1, dl2 = st.columns(2)
                 with dl1:
